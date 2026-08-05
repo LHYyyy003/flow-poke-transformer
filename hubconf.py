@@ -57,3 +57,17 @@ def myriad_billiard(*, pretrained: bool = True, **kwargs):
     model.requires_grad_(False)
     model.eval()
     return model
+
+def myriad_billiard_physics(*, pretrained: bool = False, checkpoint: str | None = None, **kwargs):
+    """MYRIAD billiards model with leak-free relation-MLP attention bias."""
+    from myriad.model import MyriadStepByStep_Large_Billiard_PhysicsBias
+
+    model = MyriadStepByStep_Large_Billiard_PhysicsBias(**kwargs)
+    if pretrained:
+        raise ValueError("No official pretrained physics-bias checkpoint is published")
+    if checkpoint is not None:
+        state = torch.load(checkpoint, weights_only=False, map_location="cpu")
+        model.load_state_dict(state.get("model", state), strict=True)
+    model.requires_grad_(False)
+    model.eval()
+    return model

@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright 2026 Stefan Baumann et al., CompVis @ LMU Munich
 
 import os
+import atexit
 import json
 import math
 from pathlib import Path
 import logging
 import random
+import subprocess
 from datetime import datetime
 
 import click
@@ -20,6 +22,114 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LambdaLR, Sequ
 import numpy as np
 from tqdm.auto import tqdm
 from einops import rearrange, repeat
+
+
+def set_requires_grad(module, value: bool):
+    for parameter in module.parameters():
+        parameter.requires_grad_(value)
+
+
+def configure_physics_training(model, train_mode: str, unfreeze_last_n_layers: int = 6):
+    """Freeze a physics-bias model for a stable, process-level training stage."""
+    set_requires_grad(model, False)
+    generator = model.transformer.physics_bias_generator
+    if generator is None:
+        raise ValueError("Physics training requires a model with use_physics_bias=True")
+    set_requires_grad(generator, True)
+    if train_mode == "physics-only":
+        pass
+    elif train_mode == "finetune":
+        depth = len(model.transformer.mid_level)
+        if unfreeze_last_n_layers <= 0 or unfreeze_last_n_layers > depth:
+            raise ValueError(f"unfreeze_last_n_layers must be in [1, {depth}], got {unfreeze_last_n_layers}")
+        for layer in model.transformer.mid_level[-unfreeze_last_n_layers:]:
+            set_requires_grad(layer, True)
+        set_requires_grad(model.transformer.out_proj, True)
+        set_requires_grad(model.distribution_head, True)
+    else:
+        raise ValueError(f"Unknown train_mode: {train_mode}")
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if not trainable:
+        raise AssertionError("No trainable parameters configured")
+    if train_mode == "physics-only":
+        bad = [name for name, p in model.named_parameters()
+               if p.requires_grad and not name.startswith("transformer.physics_bias_generator.")]
+        if bad:
+            raise AssertionError(f"Non-physics parameters are trainable in physics-only mode: {bad}")
+    return trainable
+
+
+def _strip_uniform_module_prefix(state_dict):
+    keys = list(state_dict)
+    if keys and all(key.startswith("module.") for key in keys):
+        return {key[len("module."):]: value for key, value in state_dict.items()}
+    return state_dict
+
+
+def _remap_modelscope_dinov3_layer_keys(model, state_dict):
+    """Align the ModelScope DINOv3 wrapper's extra ``model`` level safely.
+
+    The official MYRIAD checkpoint stores DINO blocks as
+    ``image_embedder.model.model.layer.*``.  The compatible ModelScope
+    Transformers wrapper stores those same blocks below
+    ``image_embedder.model.model.model.layer.*`` while keeping embeddings and
+    final norm at the original paths.  Rewrite only when the destination is
+    an actual parameter of the instantiated model, so normal HF checkpoints
+    are unchanged.
+    """
+    source = "image_embedder.model.model.layer."
+    destination = "image_embedder.model.model.model.layer."
+    model_keys = set(model.state_dict())
+    remapped = dict(state_dict)
+    for key in list(state_dict):
+        if not key.startswith(source):
+            continue
+        mapped_key = destination + key[len(source):]
+        if mapped_key in model_keys and key not in model_keys:
+            remapped[mapped_key] = remapped.pop(key)
+    return remapped
+
+
+def load_init_checkpoint(model, path):
+    checkpoint = torch.load(path, weights_only=False, map_location="cpu")
+    state_dict = checkpoint.get("model", checkpoint)
+    state_dict = _strip_uniform_module_prefix(state_dict)
+    state_dict = _remap_modelscope_dinov3_layer_keys(model, state_dict)
+
+    # Physics-bias checkpoints created before causal kinematics used five MLP
+    # inputs. Preserve those columns and initialize the six new features to
+    # zero so they can be safely fine-tuned with --init-checkpoint.
+    physics_input_key = "transformer.physics_bias_generator.mlp.0.weight"
+    target_state = model.state_dict()
+    if physics_input_key in state_dict and physics_input_key in target_state:
+        source = state_dict[physics_input_key]
+        target = target_state[physics_input_key]
+        if source.shape[:-1] == target.shape[:-1] and source.shape[-1] == 5 and target.shape[-1] == 11:
+            expanded = source.new_zeros(target.shape)
+            expanded[..., :5] = source
+            state_dict[physics_input_key] = expanded
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    invalid_missing = [key for key in incompatible.missing_keys
+                       if not key.startswith("transformer.physics_bias_generator.")]
+    if invalid_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            f"Unsafe init checkpoint: invalid missing={invalid_missing}, "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
+    return incompatible
+
+
+def current_git_commit():
+    project_dir = Path(__file__).resolve().parent
+    try:
+        return subprocess.check_output(
+            ["git", "-c", f"safe.directory={project_dir}", "-C", str(project_dir), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
 
 
 def endless_iter(iterable):
@@ -226,9 +336,8 @@ def _train(
     max_steps,
     checkpoint_freq,
     clip_grad_norm,
-    compile,
-    autotune,
     load_checkpoint,
+    init_checkpoint,
     ckpt_load_optim,
     ckpt_load_scheduler,
     lr,
@@ -237,8 +346,19 @@ def _train(
     scheduler_type,
     wandb_enabled,
     wandb_project,
+    tensorboard_enabled,
+    tensorboard_dir,
     config_dict,
+    configure_model=None,
+    train_mode=None,
+    unfreeze_last_n_layers=6,
 ):
+    if load_checkpoint is not None and init_checkpoint is not None:
+        raise ValueError("--load-checkpoint and --init-checkpoint are mutually exclusive")
+    git_commit = current_git_commit()
+    config_dict = config_dict | {"git_commit": git_commit, "init_checkpoint": init_checkpoint,
+                                 "train_mode": train_mode,
+                                 "unfreeze_last_n_layers": unfreeze_last_n_layers}
     # Output & logging setup
     slurm_id = os.environ.get("SLURM_JOB_ID")
     timestamp = datetime.now().strftime("%H-%M-%S")
@@ -297,10 +417,25 @@ def _train(
             dir=out_path,
         )
 
+    tensorboard_writer = None
+    if tensorboard_enabled and rank == 0:
+        from torch.utils.tensorboard import SummaryWriter
+
+        if tensorboard_dir is None:
+            tensorboard_path = out_path / "tensorboard"
+        else:
+            tensorboard_path = Path(tensorboard_dir) / config_dict.get("model", "train") / date_str / run_id
+        tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_path), flush_secs=10)
+        tensorboard_writer.add_text("run/config", json.dumps(config_dict, indent=2), global_step=0)
+        atexit.register(tensorboard_writer.close)
+        rank0logger.info(f"TensorBoard events: {tensorboard_path}")
+
     # Checkpoint loading pt1: read step counter before seeding
     if load_checkpoint is not None:
         checkpoint = torch.load(load_checkpoint, weights_only=False, map_location=device)
         start_step = checkpoint["step"]
+        if train_mode is not None and checkpoint.get("train_mode") != train_mode:
+            raise ValueError("Checkpoint train_mode differs; use --init-checkpoint for a new training stage")
         rank0logger.info(f"Loaded checkpoint from {load_checkpoint} @ step {start_step}.")
     else:
         checkpoint = None
@@ -314,28 +449,33 @@ def _train(
     random.seed(seed)
 
     model = model_cls().to(device)
-    real_model = model.module if hasattr(model, "module") else model
-    optimizer = AdamW(real_model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = make_scheduler(
-        optimizer, lr=lr,
-        warmup_steps=warmup_steps, max_steps=max_steps,
-        scheduler_type=scheduler_type,
-    )
-
-    rank0logger.info(model)
-    rank0logger.info(
-        f"Total params: {sum(p.numel() for p in model.parameters()) / 1e6:.3f}M"
-        f" ({sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M trainable)"
-    )
-
-    # Checkpoint loading pt2: restore state
     if load_checkpoint is not None:
-        model.load_state_dict(checkpoint["model"])
+        model.load_state_dict(_strip_uniform_module_prefix(checkpoint["model"]), strict=True)
+    elif init_checkpoint is not None:
+        incompatible = load_init_checkpoint(model, init_checkpoint)
+        rank0logger.info(f"Initialized model from {init_checkpoint}; allowed missing keys: {incompatible.missing_keys}")
+
+    trainable_parameters = configure_model(model, train_mode, unfreeze_last_n_layers) if configure_model else [
+        p for p in model.parameters() if p.requires_grad
+    ]
+    trainable_names = [name for name, p in model.named_parameters() if p.requires_grad]
+    rank0logger.info(model)
+    rank0logger.info(f"Total params: {sum(p.numel() for p in model.parameters()) / 1e6:.3f}M "
+                     f"({sum(p.numel() for p in trainable_parameters) / 1e6:.3f}M trainable)")
+    for name in trainable_names:
+        rank0logger.info(f"Trainable: {name}")
+
+    optimizer = AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
+    scheduler = make_scheduler(optimizer, lr=lr, warmup_steps=warmup_steps,
+                               max_steps=max_steps, scheduler_type=scheduler_type)
+    if load_checkpoint is not None:
         if ckpt_load_optim:
             optimizer.load_state_dict(checkpoint["optimizer"])
         if ckpt_load_scheduler:
             scheduler.load_state_dict(checkpoint["scheduler"])
-        rank0logger.info("Checkpoint state loaded.")
+        rank0logger.info("Checkpoint state loaded strictly.")
+
+    real_model = model
 
     # DDP wrapping (after state load so we wrap the restored model)
     if is_distributed:
@@ -344,11 +484,7 @@ def _train(
     # Build model-specific step functions
     init_caches, compute_step = make_train_fns(model, real_model, device, device_type, is_distributed)
 
-    if compile:
-        compute_step = torch.compile(
-            compute_step, fullgraph=False, mode="max-autotune" if autotune else "default"
-        )
-        rank0logger.info("Step function compiled with torch.compile.")
+    rank0logger.info("Training step uses eager mode (torch.compile disabled).")
 
     barrier()
 
@@ -373,17 +509,20 @@ def _train(
                 caches_initialized = True
 
             flow_mask = batch.get("flow_loss_mask", None)
-            optimizer.zero_grad()
-            loss, metrics = compute_step(
-                {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()},
+            optimizer.zero_grad(set_to_none=True)
+            device_batch = {
+                k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()
+            }
+            step_kwargs = dict(
                 block_mask=block_mask,
                 is_query=is_query,
                 L_poke=L_poke,
                 compute_metrics=True,
                 flow_mask=flow_mask.to(device) if flow_mask is not None else None,
             )
+            loss, metrics = compute_step(device_batch, **step_kwargs)
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, clip_grad_norm)
             optimizer.step()
             scheduler.step()
 
@@ -404,10 +543,21 @@ def _train(
                 "lr": scheduler.get_last_lr()[0],
             } | metrics
 
+            if device_type == "cuda":
+                train_meta |= {
+                    "gpu_memory_allocated_gib": torch.cuda.memory_allocated(device) / 1024**3,
+                    "gpu_memory_reserved_gib": torch.cuda.memory_reserved(device) / 1024**3,
+                }
+
             pbar.set_postfix(train_meta)
+            global_step = start_step + i
+            if tensorboard_writer is not None:
+                for key, value in train_meta.items():
+                    tensorboard_writer.add_scalar(f"train/{key}", value, global_step)
+                tensorboard_writer.add_scalar("system/torch_compile_active", 0, global_step)
             if wandb_enabled and rank == 0:
                 import wandb
-                wandb.log({f"train/{k}": v for k, v in train_meta.items()}, step=start_step + i)
+                wandb.log({f"train/{k}": v for k, v in train_meta.items()}, step=global_step)
 
             done = max_steps is not None and (start_step + i) >= max_steps
             if done:
@@ -423,6 +573,8 @@ def _train(
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "step": start_step + i,
+                "train_mode": train_mode,
+                "git_commit": git_commit,
             }
             ckpt_dir = out_path / "checkpoints"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -433,6 +585,9 @@ def _train(
             break
 
     barrier()
+    if tensorboard_writer is not None:
+        tensorboard_writer.flush()
+        tensorboard_writer.close()
     rank0logger.info("Training stopped.")
 
 
@@ -446,9 +601,8 @@ def common_options(func):
         click.option("--max-steps", default=None, type=int, help="Stop after this many steps (None = run forever)."),
         click.option("--checkpoint-freq", default=25_000, show_default=True, help="Save a checkpoint every N steps."),
         click.option("--clip-grad-norm", default=1.0, show_default=True, type=float, help="Gradient clipping norm."),
-        click.option("--compile/--no-compile", default=False, show_default=True, help="Use torch.compile."),
-        click.option("--autotune/--no-autotune", default=False, show_default=True, help="Use max-autotune mode."),
         click.option("--load-checkpoint", default=None, type=click.Path(exists=True), help="Checkpoint to resume from."),
+        click.option("--init-checkpoint", default=None, type=click.Path(exists=True), help="Load model weights only for a new stage."),
         click.option("--ckpt-load-optim/--no-ckpt-load-optim", default=True, show_default=True, help="Restore optimizer state."),
         click.option("--ckpt-load-scheduler/--no-ckpt-load-scheduler", default=True, show_default=True, help="Restore scheduler state."),
         click.option("--lr", default=1e-4, show_default=True, type=float, help="Peak learning rate."),
@@ -458,6 +612,10 @@ def common_options(func):
                      type=click.Choice(["linear", "cosine"]), help="LR decay schedule after warmup."),
         click.option("--wandb/--no-wandb", "wandb_enabled", default=False, show_default=True, help="Enable W&B logging."),
         click.option("--wandb-project", default="flow-poke-reasoner", show_default=True, help="W&B project name."),
+        click.option("--tensorboard/--no-tensorboard", "tensorboard_enabled", default=True, show_default=True,
+                     help="Write per-step TensorBoard metrics."),
+        click.option("--tensorboard-dir", default=None, type=click.Path(file_okay=False),
+                     help="TensorBoard root (default: the run output directory)."),
     ]
     for opt in reversed(options):
         func = opt(func)
@@ -564,6 +722,65 @@ def train_billiards(batch_size, num_workers, nr_balls, frame_size, duration, dt,
         model_cls=MyriadStepByStep_Large_Billiard,
         make_train_fns=myriad_make_train_fns,
         config_dict=config_dict,
+        **common_kwargs,
+    )
+
+
+@cli.command("billiards-physics")
+@common_options
+@click.option("--train-mode", default="physics-only", show_default=True,
+              type=click.Choice(["physics-only", "finetune"]))
+@click.option("--unfreeze-last-n-layers", default=6, show_default=True, type=int)
+@click.option("--physics-bias-checkpoint-chunks/--no-physics-bias-checkpoint-chunks",
+              default=False, show_default=True)
+@click.option("--batch-size", default=1, show_default=True, type=int)
+@click.option("--num-workers", default=4, show_default=True, type=int)
+@click.option("--nr-balls", default=16, show_default=True, type=int)
+@click.option("--frame-size", default=512, show_default=True, type=int)
+@click.option("--duration", default=0.5, show_default=True, type=float)
+@click.option("--dt", default=0.01, show_default=True, type=float)
+def train_billiards_physics(train_mode, unfreeze_last_n_layers, physics_bias_checkpoint_chunks,
+                            batch_size, num_workers, nr_balls, frame_size, duration, dt, **common_kwargs):
+    """Train the separate MYRIAD billiards model with relation-MLP attention bias."""
+    from myriad.model import MyriadStepByStep_Large_Billiard_PhysicsBias
+    from myriad.data_billiards import BilliardSimDataModule
+
+    data = BilliardSimDataModule(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        train={"dataset_config": dict(nr_balls=nr_balls, frame_size=frame_size, duration=duration, dt=dt)},
+    )
+    physics_config = {
+        "use_physics_bias": True,
+        "physics_bias_hidden_dim": 64,
+        "physics_bias_depth": 2,
+        "physics_bias_time_scale": 50.0,
+        "physics_bias_max_abs": 1.0,
+        "physics_bias_ball_radius": 0.033,
+        "physics_bias_num_layers": 4,
+        "physics_bias_query_chunk_size": 64,
+        "physics_bias_checkpoint_chunks": physics_bias_checkpoint_chunks,
+    }
+
+    def model_cls():
+        model = MyriadStepByStep_Large_Billiard_PhysicsBias()
+        model.transformer.physics_bias_generator.checkpoint_chunks = physics_bias_checkpoint_chunks
+        return model
+
+    config_dict = dict(
+        model="billiard-physics", dataset="billiards", batch_size=batch_size,
+        num_workers=num_workers, nr_balls=nr_balls, frame_size=frame_size,
+        duration=duration, dt=dt, train_mode=train_mode,
+        unfreeze_last_n_layers=unfreeze_last_n_layers, **physics_config, **common_kwargs,
+    )
+    _train(
+        data=data,
+        model_cls=model_cls,
+        make_train_fns=myriad_make_train_fns,
+        config_dict=config_dict,
+        configure_model=configure_physics_training,
+        train_mode=train_mode,
+        unfreeze_last_n_layers=unfreeze_last_n_layers,
         **common_kwargs,
     )
 

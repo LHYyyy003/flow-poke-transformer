@@ -626,8 +626,8 @@ def main(
     out_path.mkdir(parents=True, exist_ok=True)
 
     pred_function = None
-    if method == "ours":
-        model = get_model("billiard", checkpoint_path)
+    if method in ("ours", "ours-physics"):
+        model = get_model("billiard-physics" if method == "ours-physics" else "billiard", checkpoint_path)
         pred_function = _ours_pred_function
     else:
         raise NotImplementedError(f"Method {method} not implemented.")

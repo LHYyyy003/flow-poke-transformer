@@ -176,11 +176,19 @@ def simulate_billiard_game(
     vel = []
     collisions = []
     for i in range(frames):
-        ball_ball_collisions, ball_obs_collisions = bld.evolve(start_time + i * dt)
+        collision_result = bld.evolve(start_time + i * dt)
+        # billiards<0.5 returned two collision counts, while >=0.5 returns a
+        # list of collision records. The dataset only exposes a boolean and
+        # neither representation is consumed by the physics-bias model.
+        if (isinstance(collision_result, tuple) and len(collision_result) == 2
+                and all(isinstance(value, (int, np.integer)) for value in collision_result)):
+            collision_occurred = collision_result[0] > 0 or collision_result[1] > 0
+        else:
+            collision_occurred = len(collision_result) > 0
         ts.append(bld.time)
         pos.append(bld.balls_position.copy())
         vel.append(bld.balls_velocity.copy())
-        collisions.append(ball_ball_collisions > 0 or ball_obs_collisions > 0)
+        collisions.append(collision_occurred)
     return ts, pos, vel, collisions
 
 # ---------------------------------------------------------------------------------------------------------------------

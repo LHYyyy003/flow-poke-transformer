@@ -1,0 +1,15 @@
+# Reproduction environment for the official FPT interactive demo.
+# PyTorch 2.8 is used because the code relies on FlexAttention and explicitly
+# documents its compile/cudagraph behavior against this release.
+torch==2.8.0
+torchvision==0.23.0
+einops==0.8.1
+jaxtyping==0.3.2
+transformers==4.55.4
+tqdm==4.67.1
+fire==0.7.1
+gradio==5.44.1
+matplotlib==3.10.5
+pillow==11.3.0
+# Required by httpx/Gradio when this host's SOCKS proxy is enabled.
+socksio==1.0.0

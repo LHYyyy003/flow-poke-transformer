@@ -15,7 +15,11 @@ from pathlib import Path
 from omegaconf import DictConfig
 from functools import partial
 
-from myriad.model import MyriadStepByStep, RFHeadDistribution, FusedTransformerLayer, MyriadStepByStep_Large, MyriadStepByStep_Large_Billiard
+from myriad.model import (
+    MyriadStepByStep, RFHeadDistribution, FusedTransformerLayer,
+    MyriadStepByStep_Large, MyriadStepByStep_Large_Billiard,
+    MyriadStepByStep_Large_Billiard_PhysicsBias,
+)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -261,6 +265,8 @@ def get_model(model_id: str, checkpoint_path: str, compile_mode: str = "default"
         model = MyriadStepByStep_Large()
     elif model_id == "billiard":
         model = MyriadStepByStep_Large_Billiard()
+    elif model_id == "billiard-physics":
+        model = MyriadStepByStep_Large_Billiard_PhysicsBias()
     else:
         raise ValueError(f"Unknown model_id {model_id}")
 

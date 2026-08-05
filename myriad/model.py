@@ -11,6 +11,7 @@ from torch.distributions.mixture_same_family import MixtureSameFamily as _Mixtur
 from torch.distributions.categorical import Categorical as _Categorical
 from torch.distributions.multivariate_normal import MultivariateNormal as _MultivariateNormal
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from typing import Any, Literal
 from abc import ABC, abstractmethod
 from jaxtyping import Float, Bool, Int
@@ -20,7 +21,21 @@ from functools import partial
 from .dinov3 import DinoFeatureExtractor
 
 
-flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+def physics_flex_attention(q, k, v, physics_bias, block_mask, q_motion_offset, k_motion_offset, scale):
+    """Apply physics score bias with eager FlexAttention."""
+    lq_motion, lk_motion = physics_bias.shape[-2:]
+
+    def score_mod(score, batch, head, q_idx, k_idx):
+        q_motion_idx = q_idx - q_motion_offset
+        k_motion_idx = k_idx - k_motion_offset
+        valid = ((q_motion_idx >= 0) & (k_motion_idx >= 0)
+                 & (q_motion_idx < lq_motion) & (k_motion_idx < lk_motion))
+        q_safe = q_motion_idx.clamp(0, lq_motion - 1)
+        k_safe = k_motion_idx.clamp(0, lk_motion - 1)
+        value = physics_bias[batch, head, q_safe, k_safe].to(score.dtype)
+        return score + torch.where(valid, value, torch.zeros_like(score))
+
+    return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask, scale=scale)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -447,7 +462,6 @@ class FlowPokeEmbedder(nn.Module):
             id_emb_table = F.normalize(id_emb_table, dim=-1)
         return id_emb_table
 
-    # @torch.compile()
     def forward(
         self,
         x: Float[torch.Tensor, "b l 2"],
@@ -517,6 +531,149 @@ class FlowPokeOutput(nn.Module):
 # ---------------------------------------------------------------------------------------------------------------------
 # Fused Flow Poke Transformer
 # ---------------------------------------------------------------------------------------------------------------------
+
+class PhysicsRelationBiasMLP(nn.Module):
+    """Per-head attention bias built only from current and historical positions."""
+
+    def __init__(
+        self,
+        n_heads: int,
+        hidden_dim: int = 64,
+        depth: int = 2,
+        time_scale: float = 50.0,
+        max_abs_bias: float = 1.0,
+        ball_radius: float = 0.033,
+        n_bias_layers: int = 4,
+        query_chunk_size: int = 64,
+        checkpoint_chunks: bool = False,
+    ):
+        super().__init__()
+        if depth < 1:
+            raise ValueError(f"depth must be >= 1, got {depth}")
+        if query_chunk_size < 1:
+            raise ValueError(f"query_chunk_size must be >= 1, got {query_chunk_size}")
+        if time_scale <= 0 or max_abs_bias <= 0 or ball_radius <= 0:
+            raise ValueError("time_scale, max_abs_bias, and ball_radius must be positive")
+        if n_bias_layers < 1:
+            raise ValueError(f"n_bias_layers must be >= 1, got {n_bias_layers}")
+        self.n_heads = n_heads
+        self.time_scale = float(time_scale)
+        self.max_abs_bias = float(max_abs_bias)
+        self.ball_radius = float(ball_radius)
+        self.n_bias_layers = n_bias_layers
+        self.query_chunk_size = query_chunk_size
+        self.checkpoint_chunks = checkpoint_chunks
+
+        # Keep the original five relation inputs first, then append causal
+        # kinematics: relative velocity (2), closing speed, signed surface
+        # distance, time to closest approach, and an approaching indicator.
+        layers: list[nn.Module] = [nn.Linear(11, hidden_dim), nn.SiLU()]
+        for _ in range(depth - 1):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SiLU()])
+        layers.append(zero_init(nn.Linear(hidden_dim, n_heads)))
+        self.mlp = nn.Sequential(*layers)
+        # The physical feature encoder is shared, but every affected layer and
+        # attention head can independently gate its contribution.
+        self.layer_head_scales = nn.Parameter(torch.ones(n_bias_layers, n_heads))
+
+    @staticmethod
+    def _historical_velocity(
+        pos: torch.Tensor,
+        time: torch.Tensor,
+        track: torch.Tensor,
+        history_pos: torch.Tensor,
+        history_time: torch.Tensor,
+        history_track: torch.Tensor,
+        history_is_query: torch.Tensor,
+    ) -> torch.Tensor:
+        """Finite-difference velocity using the latest earlier observed token."""
+        same_track = track[:, :, None] == history_track[:, None, :]
+        earlier = history_time[:, None, :] < time[:, :, None]
+        observed = ~history_is_query[:, None, :]
+        valid = same_track & earlier & observed
+
+        candidate_time = history_time[:, None, :].expand(-1, pos.size(1), -1)
+        candidate_time = candidate_time.masked_fill(~valid, float("-inf"))
+        previous_time, previous_idx = candidate_time.max(dim=-1)
+        has_history = valid.any(dim=-1)
+        gather_idx = previous_idx[..., None].expand(-1, -1, 2)
+        previous_pos = torch.gather(history_pos, 1, gather_idx)
+        dt = (time - previous_time).clamp_min(1e-6)
+        velocity = (pos - previous_pos) / dt[..., None]
+        return torch.where(has_history[..., None], velocity, torch.zeros_like(velocity))
+
+    def _chunk(
+        self,
+        pos_q: torch.Tensor,
+        time_q: torch.Tensor,
+        track_q: torch.Tensor,
+        pos_k: torch.Tensor,
+        time_k: torch.Tensor,
+        track_k: torch.Tensor,
+        is_query_q: torch.Tensor,
+        is_query_k: torch.Tensor,
+    ) -> torch.Tensor:
+        rel_pos = pos_k[:, None, :, :] - pos_q[:, :, None, :]
+        distance = torch.linalg.vector_norm(rel_pos, dim=-1, keepdim=True)
+        delta_time = (time_q[:, :, None] - time_k[:, None, :]).unsqueeze(-1)
+        delta_time = torch.clamp(delta_time / self.time_scale, min=-1.0, max=1.0)
+        same_track = (track_q[:, :, None] == track_k[:, None, :]).unsqueeze(-1).to(rel_pos.dtype)
+        velocity_q = self._historical_velocity(
+            pos_q, time_q, track_q, pos_k, time_k, track_k, is_query_k
+        )
+        velocity_k = self._historical_velocity(
+            pos_k, time_k, track_k, pos_k, time_k, track_k, is_query_k
+        )
+        rel_velocity = velocity_k[:, None, :, :] - velocity_q[:, :, None, :]
+        radial_velocity = (rel_pos * rel_velocity).sum(dim=-1, keepdim=True)
+        closing_speed = -radial_velocity / distance.clamp_min(1e-6)
+        surface_distance = distance - 2.0 * self.ball_radius
+        relative_speed_sq = rel_velocity.square().sum(dim=-1, keepdim=True)
+        t_closest = -radial_velocity / relative_speed_sq.clamp_min(1e-8)
+        t_closest = torch.clamp(t_closest / self.time_scale, min=-1.0, max=1.0)
+        approaching = (closing_speed > 0).to(rel_pos.dtype)
+        features = torch.cat([
+            rel_pos, distance, delta_time.to(rel_pos.dtype), same_track,
+            rel_velocity, closing_speed, surface_distance, t_closest, approaching,
+        ], dim=-1)
+        assert features.shape[-1] == 11
+        raw_bias = self.mlp(features)
+        bias = self.max_abs_bias * torch.tanh(raw_bias / self.max_abs_bias)
+        return bias.permute(0, 3, 1, 2).contiguous()
+
+    def forward(self, pos_q, time_q, track_q, pos_k, time_k, track_k,
+                is_query_q=None, is_query_k=None):
+        if pos_q.ndim != 3 or pos_k.ndim != 3 or pos_q.size(-1) != 2 or pos_k.size(-1) != 2:
+            raise ValueError("pos_q and pos_k must have shape [B, L, 2]")
+        if pos_q.size(0) != pos_k.size(0):
+            raise ValueError("query/key batch sizes must match")
+        if is_query_q is None:
+            is_query_q = torch.zeros_like(track_q, dtype=torch.bool)
+        if is_query_k is None:
+            is_query_k = torch.zeros_like(track_k, dtype=torch.bool)
+        chunks = []
+        for start in range(0, pos_q.size(1), self.query_chunk_size):
+            args = (pos_q[:, start : start + self.query_chunk_size], time_q[:, start : start + self.query_chunk_size],
+                    track_q[:, start : start + self.query_chunk_size], pos_k, time_k, track_k,
+                    is_query_q[:, start : start + self.query_chunk_size], is_query_k)
+            if self.checkpoint_chunks and self.training:
+                chunk_bias = checkpoint(self._chunk, *args, use_reentrant=False)
+            else:
+                chunk_bias = self._chunk(*args)
+            chunks.append(chunk_bias)
+        if not chunks:
+            return pos_q.new_zeros((pos_q.size(0), self.n_heads, 0, pos_k.size(1)))
+        bias = torch.cat(chunks, dim=2)
+        if not torch.isfinite(bias).all():
+            raise FloatingPointError("PhysicsRelationBiasMLP produced NaN or Inf")
+        return bias
+
+    def for_layer(self, bias: torch.Tensor, active_layer_index: int) -> torch.Tensor:
+        if not 0 <= active_layer_index < self.n_bias_layers:
+            raise IndexError(f"active_layer_index out of range: {active_layer_index}")
+        scale = self.layer_head_scales[active_layer_index][None, :, None, None].to(dtype=bias.dtype)
+        scaled_bias = bias * scale
+        return self.max_abs_bias * torch.tanh(scaled_bias / self.max_abs_bias)
 
 class FusedTransformerLayer(nn.Module):
 
@@ -596,6 +753,9 @@ class FusedTransformerLayer(nn.Module):
         scale: Float[torch.Tensor, "b d_model"],
         block_mask,
         i_kv: int | None = None,
+        physics_bias: torch.Tensor | None = None,
+        q_motion_offset: int = 0,
+        k_motion_offset: int = 0,
         **kwargs,
     ):
         B, L, _ = x.shape
@@ -610,19 +770,52 @@ class FusedTransformerLayer(nn.Module):
             k = self.kv_cache.k[:B, :, : i_kv + L]
             v = self.kv_cache.v[:B, :, : i_kv + L]
 
-        # Attention operation using provided attention mask (fused self- and cross-attention)
-        if isinstance(block_mask, str) and block_mask == "causal":
+        # Keep the original no-bias path unchanged for checkpoint-compatible ablations.
+        if physics_bias is None and isinstance(block_mask, str) and block_mask == "causal":
             attn = F.scaled_dot_product_attention(
                 q, k, v, scale=1.0 if self.scaled_cosine_sim else None, is_causal=True
             )
-        elif isinstance(block_mask, torch.Tensor) or block_mask is None:
+        elif physics_bias is None and (isinstance(block_mask, torch.Tensor) or block_mask is None):
             attn = F.scaled_dot_product_attention(
                 q, k, v, scale=1.0 if self.scaled_cosine_sim else None, attn_mask=block_mask
             )
-        else:
-            attn = flex_attention_compiled(
+        elif physics_bias is None:
+            attn = flex_attention(
                 q, k, v, scale=1.0 if self.scaled_cosine_sim else None, block_mask=block_mask
             )
+        else:
+            if physics_bias.shape[:2] != (B, self.n_heads):
+                raise AssertionError(f"physics bias batch/head mismatch: {physics_bias.shape=}, {B=}, {self.n_heads=}")
+            lq_motion, lk_motion = physics_bias.shape[-2:]
+            if q_motion_offset + lq_motion != q.size(-2) or k_motion_offset + lk_motion != k.size(-2):
+                raise AssertionError(
+                    f"physics bias does not align with attention: bias={physics_bias.shape}, "
+                    f"q={q.shape}, k={k.shape}, offsets=({q_motion_offset}, {k_motion_offset})"
+                )
+
+            if isinstance(block_mask, BlockMask):
+                attn = physics_flex_attention(
+                    q, k, v, physics_bias, block_mask, q_motion_offset, k_motion_offset,
+                    1.0 if self.scaled_cosine_sim else None,
+                )
+            else:
+                full_bias = q.new_zeros((B, self.n_heads, q.size(-2), k.size(-2)))
+                full_bias[:, :, q_motion_offset:, k_motion_offset:] = physics_bias.to(q.dtype)
+                if isinstance(block_mask, str):
+                    if block_mask != "causal":
+                        raise ValueError(f"Unknown attention mask string: {block_mask}")
+                    q_idx = torch.arange(q.size(-2), device=q.device)[:, None]
+                    k_idx = torch.arange(k.size(-2), device=q.device)[None, :]
+                    allowed = k_idx <= q_idx
+                    attn_mask = full_bias.masked_fill(~allowed, float("-inf"))
+                elif block_mask is None:
+                    attn_mask = full_bias
+                elif block_mask.dtype == torch.bool:
+                    attn_mask = full_bias.masked_fill(~block_mask, float("-inf"))
+                else:
+                    attn_mask = full_bias + block_mask.to(q.dtype)
+                attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
+                                                      scale=1.0 if self.scaled_cosine_sim else None)
         attn_out = einops.rearrange(attn, "b nh l d -> b l (nh d)")
 
         # Combine attention output and FFN output
@@ -653,6 +846,15 @@ class FusedTransformer(nn.Module):
         time_norm_size: int = -1,
         dropout: float = 0.0,
         scaled_cosine_sim: bool = True,
+        use_physics_bias: bool = False,
+        physics_bias_hidden_dim: int = 64,
+        physics_bias_depth: int = 2,
+        physics_bias_time_scale: float = 50.0,
+        physics_bias_max_abs: float = 1.0,
+        physics_bias_ball_radius: float = 0.033,
+        physics_bias_num_layers: int | None = None,
+        physics_bias_query_chunk_size: int = 64,
+        physics_bias_checkpoint_chunks: bool = False,
         # use_full_skip: bool = True,
         # num_learnable_track_ids: int = -1,
     ):
@@ -660,6 +862,11 @@ class FusedTransformer(nn.Module):
 
         self.ada_norm_size = ada_norm_size
         self.time_norm_size = time_norm_size
+        self.use_physics_bias = use_physics_bias
+        physics_bias_num_layers = min(4, depth) if physics_bias_num_layers is None else physics_bias_num_layers
+        if use_physics_bias and not 1 <= physics_bias_num_layers <= depth:
+            raise ValueError(f"physics_bias_num_layers must be in [1, {depth}], got {physics_bias_num_layers}")
+        self.physics_bias_num_layers = physics_bias_num_layers
         # self.use_full_skip = use_full_skip
 
         self.embedder = FlowPokeEmbedder(
@@ -699,6 +906,25 @@ class FusedTransformer(nn.Module):
             )
             mid_level.append(layer)
         self.mid_level = Level(mid_level)
+
+        self.physics_bias_generator = (
+            PhysicsRelationBiasMLP(
+                n_heads=width // d_head,
+                hidden_dim=physics_bias_hidden_dim,
+                depth=physics_bias_depth,
+                time_scale=physics_bias_time_scale,
+                max_abs_bias=physics_bias_max_abs,
+                ball_radius=physics_bias_ball_radius,
+                n_bias_layers=physics_bias_num_layers,
+                query_chunk_size=physics_bias_query_chunk_size,
+                checkpoint_chunks=physics_bias_checkpoint_chunks,
+            ) if use_physics_bias else None
+        )
+        self.register_buffer("physics_pos_cache", torch.empty((1, 0, 2)), persistent=False)
+        self.register_buffer("physics_time_cache", torch.empty((1, 0)), persistent=False)
+        self.register_buffer("physics_track_cache", torch.empty((1, 0), dtype=torch.long), persistent=False)
+        self.register_buffer("physics_query_cache", torch.empty((1, 0), dtype=torch.bool), persistent=False)
+        self.cached_image_prefix_length: int | None = None
 
     
     # Factored-out first part of forward pass (until layers)
@@ -780,6 +1006,8 @@ class FusedTransformer(nn.Module):
         compute_cross: bool = True,
         **kwargs,
     ):
+        motion_pos_current, motion_time_current, motion_track_current = pos, time, track_id
+        motion_query_current = is_query
         x, theta, scale, L_cross, kwargs = self._fwd_1(
             x=x,
             x_cross=x_cross,
@@ -796,10 +1024,61 @@ class FusedTransformer(nn.Module):
 
         skip = x[:, L_cross:]
 
+        physics_bias = None
+        q_motion_offset = k_motion_offset = 0
+        if self.use_physics_bias:
+            if self.physics_bias_generator is None:
+                raise AssertionError("use_physics_bias=True without a generator")
+            B_motion, L_motion, _ = motion_pos_current.shape
+            if i_kv is None:
+                pos_k, time_k, track_k = motion_pos_current, motion_time_current, motion_track_current
+                query_k = motion_query_current
+                q_motion_offset = k_motion_offset = L_cross
+            else:
+                if i_kv == 0:
+                    if not compute_cross or L_cross <= 0:
+                        raise AssertionError("physics metadata prefill requires image-prefix computation")
+                    self.cached_image_prefix_length = L_cross
+                    self._ensure_physics_cache(B_motion, max(self.physics_pos_cache.size(1), L_motion),
+                                               motion_pos_current.dtype, motion_pos_current.device)
+                    write_start = 0
+                else:
+                    if compute_cross or self.cached_image_prefix_length is None:
+                        raise AssertionError("incremental physics inference requires a previous prefill")
+                    if i_kv < self.cached_image_prefix_length:
+                        raise AssertionError("i_kv points inside the cached image prefix")
+                    write_start = i_kv - self.cached_image_prefix_length
+                write_end = write_start + L_motion
+                if write_end > self.physics_pos_cache.size(1):
+                    raise AssertionError("physics metadata write exceeds allocated cache; call grow_kv_cache first")
+                self.physics_pos_cache[:B_motion, write_start:write_end] = motion_pos_current
+                self.physics_time_cache[:B_motion, write_start:write_end] = motion_time_current
+                self.physics_track_cache[:B_motion, write_start:write_end] = motion_track_current.long()
+                self.physics_query_cache[:B_motion, write_start:write_end] = motion_query_current.bool()
+                pos_k = self.physics_pos_cache[:B_motion, :write_end]
+                time_k = self.physics_time_cache[:B_motion, :write_end]
+                track_k = self.physics_track_cache[:B_motion, :write_end]
+                query_k = self.physics_query_cache[:B_motion, :write_end]
+                q_motion_offset = L_cross if i_kv == 0 else 0
+                k_motion_offset = self.cached_image_prefix_length
+            physics_bias = self.physics_bias_generator(
+                motion_pos_current, motion_time_current, motion_track_current, pos_k, time_k, track_k,
+                motion_query_current, query_k,
+            )
+
         # standard transformer forward
         B, *DIMS, C = x.shape
         x = x.reshape(B, -1, C)
-        x = self.mid_level(x, theta, scale=scale, block_mask=block_mask, i_kv=i_kv, **kwargs)
+        first_physics_layer = len(self.mid_level) - self.physics_bias_num_layers
+        for layer_index, layer in enumerate(self.mid_level):
+            layer_bias = None
+            if physics_bias is not None and layer_index >= first_physics_layer:
+                layer_bias = self.physics_bias_generator.for_layer(
+                    physics_bias, layer_index - first_physics_layer
+                )
+            x = layer(x, theta, scale=scale, block_mask=block_mask, i_kv=i_kv,
+                      physics_bias=layer_bias, q_motion_offset=q_motion_offset,
+                      k_motion_offset=k_motion_offset, **kwargs)
         x = x.reshape(B, *DIMS, C)
 
         # out projection after removing cross tokens
@@ -815,17 +1094,42 @@ class FusedTransformer(nn.Module):
         for layer in self.mid_level:
             layer.kv_cache.k = layer.kv_cache.k.new_zeros((b, layer.kv_cache.k.size(1), l, layer.kv_cache.k.size(3)))
             layer.kv_cache.v = layer.kv_cache.v.new_zeros((b, layer.kv_cache.v.size(1), l, layer.kv_cache.v.size(3)))
+        self.cached_image_prefix_length = None
+        self._ensure_physics_cache(b, l, self.physics_pos_cache.dtype, self.physics_pos_cache.device, clear=True)
+
+    def _ensure_physics_cache(self, b: int, l: int, dtype: torch.dtype, device: torch.device, clear: bool = False):
+        needs_resize = (self.physics_pos_cache.size(0) < b or self.physics_pos_cache.size(1) < l
+                        or self.physics_pos_cache.dtype != dtype or self.physics_pos_cache.device != device)
+        if needs_resize or clear:
+            old_pos, old_time, old_track = self.physics_pos_cache, self.physics_time_cache, self.physics_track_cache
+            old_query = self.physics_query_cache
+            self.physics_pos_cache = torch.zeros((b, l, 2), dtype=dtype, device=device)
+            self.physics_time_cache = torch.zeros((b, l), dtype=dtype, device=device)
+            self.physics_track_cache = torch.zeros((b, l), dtype=torch.long, device=device)
+            self.physics_query_cache = torch.zeros((b, l), dtype=torch.bool, device=device)
+            if needs_resize and not clear and old_pos.numel() > 0:
+                cb, cl = min(b, old_pos.size(0)), min(l, old_pos.size(1))
+                self.physics_pos_cache[:cb, :cl] = old_pos[:cb, :cl].to(device=device, dtype=dtype)
+                self.physics_time_cache[:cb, :cl] = old_time[:cb, :cl].to(device=device, dtype=dtype)
+                self.physics_track_cache[:cb, :cl] = old_track[:cb, :cl].to(device=device)
+                self.physics_query_cache[:cb, :cl] = old_query[:cb, :cl].to(device=device)
 
     def grow_kv_cache(self, b: int, l: int):
         for layer in self.mid_level:
             b_cur, _, l_cur, _ = layer.kv_cache.k.shape
             if b_cur < b or l_cur < l:
-                layer.kv_cache.k = layer.kv_cache.k.new_zeros(
+                old_k, old_v = layer.kv_cache.k, layer.kv_cache.v
+                new_k = old_k.new_zeros(
                     (b, layer.kv_cache.k.size(1), l, layer.kv_cache.k.size(3))
                 )
-                layer.kv_cache.v = layer.kv_cache.v.new_zeros(
+                new_v = old_v.new_zeros(
                     (b, layer.kv_cache.v.size(1), l, layer.kv_cache.v.size(3))
                 )
+                copy_b, copy_l = min(b, b_cur), min(l, l_cur)
+                new_k[:copy_b, :, :copy_l] = old_k[:copy_b, :, :copy_l]
+                new_v[:copy_b, :, :copy_l] = old_v[:copy_b, :, :copy_l]
+                layer.kv_cache.k, layer.kv_cache.v = new_k, new_v
+        self._ensure_physics_cache(b, l, self.physics_pos_cache.dtype, self.physics_pos_cache.device)
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Rectified Flow Posterior Distribution Head
@@ -1746,6 +2050,52 @@ MyriadStepByStep_Large_Billiard = partial(
         "cat_embs": False,
         "relu": False,
         "cond_dropout": 0.,
+        "steps": 50,
+        "cfg_scale": 1.0,
+    },
+)
+
+MyriadStepByStep_Large_Billiard_PhysicsBias = partial(
+    MyriadStepByStep,
+    width=1024,
+    depth=24,
+    train_image_feature_extractor=True,
+    distribution_type="fm",
+    transformer_params={
+        "d_head": 128,
+        "out_mlp_depth": 2,
+        "ff_expand": 4,
+        "ada_norm_size": 1024,
+        "time_norm_size": -1,
+        "input_scale": 10,
+        "emb_depth": 3,
+        "track_id_embedding": True,
+        "max_num_track_ids": 256,
+        "scaled_cosine_sim": True,
+        "use_physics_bias": True,
+        "physics_bias_hidden_dim": 64,
+        "physics_bias_depth": 2,
+        "physics_bias_time_scale": 50.0,
+        "physics_bias_max_abs": 1.0,
+        "physics_bias_ball_radius": 0.033,
+        "physics_bias_num_layers": 4,
+        "physics_bias_query_chunk_size": 64,
+        "physics_bias_checkpoint_chunks": False,
+    },
+    image_feature_extractor_params={
+        "model_version": "dinov3_vitl16",
+        "image_size": 512,
+    },
+    distribution_head_params={
+        "depth": 3,
+        "d_cond": 1024,
+        "expansion_factor": 1,
+        "internal_value_scale": 500,
+        "value_scale_cascade": True,
+        "value_scale_cascade_steps": 512,
+        "cat_embs": False,
+        "relu": False,
+        "cond_dropout": 0.0,
         "steps": 50,
         "cfg_scale": 1.0,
     },

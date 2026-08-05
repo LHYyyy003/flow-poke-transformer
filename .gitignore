@@ -179,6 +179,13 @@ cython_debug/
 
 # Training outputs
 output/
+outputs/
+checkpoints/
+logs/
+
+# Editor swap files
+*.swp
+*.swo
 
 # Eval Outputs
 eval_results*

@@ -50,17 +50,17 @@ class DinoV3HF(nn.Module):
 
         self.num_register_tokens = self.model.config.num_register_tokens
         self.patch_size = self.model.config.patch_size
-        
+
         self.gradient_last_blocks = gradient_last_blocks
         if gradient_last_blocks is not None and gradient_last_blocks > 0:
             blocks = self.model.encoder.layer
             for b in blocks[-gradient_last_blocks:]:
                 b.requires_grad_(True)
                 b.train()
-    
+
     def _tokens_to_maps_and_cls(self, last_hidden_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, L, D = last_hidden_state.shape
-        
+
         cls = last_hidden_state[:, 0]  # B x D
         patches = last_hidden_state[:, 1+self.num_register_tokens:]  # B x (L-1) x D
 
@@ -71,10 +71,10 @@ class DinoV3HF(nn.Module):
         s = int(math.sqrt(N))
         if s * s != N:
             raise ValueError(f"Patch tokens {N} don't form a square; got sqrt={s}. Ensure square resize to {self.model_size}.")
-        
+
         feats = einops.rearrange(patches, 'b (h w) d -> b d h w', h=s, w=s)
         return feats, cls
-    
+
     def forward_features(self, imgs: Float[torch.Tensor, "B C H W"], masks) -> tuple[Float[torch.Tensor, "B D h' w'"], Float[torch.Tensor, "B D"]]:
         out = self.model(pixel_values=imgs)
         tokens = out.last_hidden_state  # B x L x D
@@ -83,7 +83,7 @@ class DinoV3HF(nn.Module):
             "x_norm_patchtokens": einops.rearrange(features, "b d h w -> b (h w) d"),
             "x_norm_clstoken": cls,
         }
-    
+
     def forward(self, imgs: Float[torch.Tensor, "B C H W"]) -> tuple[Float[torch.Tensor, "B D h' w'"], Float[torch.Tensor, "B D"]]:
         # Expect inputs scaled to [-1, 1]
         assert imgs.min() >= -1.0

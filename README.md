@@ -106,16 +106,64 @@ For data preprocessing instructions, please refer to the [corresponding readme](
 **Launching Training.**
 Single-GPU training can be launched via
 ```shell
-python train.py [fpt | myriad | billiards] --tar_base /path/to/preprocessed/shards --out_dir output/test --compile True
+python train.py [fpt | myriad | billiards] --tar_base /path/to/preprocessed/shards --out_dir output/test
 ```
 Similarly, multi-GPU training, e.g., on 2 GPUs, can be launched using torchrun:
 ```shell
 torchrun --nnodes 1 --nproc-per-node 2 train.py [...]
 ```
 Training can be continued from a previous checkpoint by specifying, e.g., `--load_checkpoint output/test/checkpoints/checkpoint_0100000.pt`.
-Remove `--compile True` for significantly faster startup time at the cost of slower training & significantly increased VRAM usage.
+Training uses standard PyTorch eager execution.
 
 For a full list of available arguments, refer to [`train.py`](train.py). We use [`click`](https://click.palletsprojects.com/en/stable/), such that every argument to the main train function is directly available as a CLI argument.
+
+## Billiards Physics-Relation Attention Bias
+
+The opt-in MyriadStepByStep_Large_Billiard_PhysicsBias configuration applies physical attention bias only to the
+last four of the 24 Transformer layers. The relation encoder is shared, while every affected layer and attention
+head has an independent learned scale.
+
+Its inputs retain the original relative position, center distance, time difference, and same-track indicator, and
+add causal finite-difference kinematics derived from the latest earlier observed position of the same ball:
+relative velocity, closing speed, signed ball-surface distance, time-to-closest-approach, and an approaching flag.
+Query tokens are never used as velocity history, so neither targets nor future positions enter these features.
+
+The per-head relation output is zero-initialized and bounded to ±1 with tanh; image-token pairs receive zero bias,
+and the existing causal BlockMask remains authoritative. The normalized billiards radius is 0.033.
+
+Use --init-checkpoint to load the original model weights for a fresh optimization stage. Stage 1 trains the
+relation encoder and per-layer/per-head scales. Use the billiards-physics command with --train-mode physics-only
+in eager mode. Stage 2 must be a new process and use --init-checkpoint with --train-mode finetune.
+
+Physics-bias training uses eager execution throughout. This avoids the Triton resource-limit failure observed when
+compiling the full 24-layer model on the RTX 5090.
+
+The default physics training launcher uses a 200-step warmup and saves a checkpoint every 500 steps.
+
+The supplied training launcher writes TensorBoard events under `/root/tf-logs/flow-poke`, which is visible to the
+AutoDL TensorBoard service on port 6007. The `train/loss` series is written after every optimizer step; learning
+rate, gradient norm, evaluation metrics, allocated/reserved GPU memory, and compile/eager state are recorded too.
+For a local server, run:
+
+~~~shell
+tensorboard --logdir /root/tf-logs --port 6007 --bind_all
+~~~
+
+Evaluate with:
+python -m scripts.myriad_eval.billiard_planning --method ours-physics --checkpoint_path PATH.
+
+For the tested AutoDL stack, install requirements-training.txt into a Python 3.12 environment with CUDA 12.8.
+The DINOv3 backbone is gated, so accept its Hugging Face terms and authenticate before downloading it:
+
+~~~shell
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements-training.txt
+hf auth login
+hf download CompVis/myriad myriad_billiard.pt --local-dir checkpoints
+~~~
+
 
 # 💽 OWM
 
