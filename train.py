@@ -132,6 +132,19 @@ def current_git_commit():
         return "unknown"
 
 
+def atomic_torch_save(payload, destination: Path) -> None:
+    """Save without exposing a partial checkpoint at the final path."""
+    destination = Path(destination)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def endless_iter(iterable):
     while True:
         yield from iterable
@@ -298,12 +311,15 @@ def myriad_make_train_fns(model, real_model, device, device_type, is_distributed
                 camera_static=batch["camera_static"],
                 mask=block_mask, d_img=d_img, track_id_emb_table=None,
             )
-            loss = distribution[:, L_poke:].loss(flow_target)
+            per_token_loss = distribution[:, L_poke:].loss(flow_target)
             if flow_mask is not None:
                 valid = flow_mask.sum()
-                loss = (loss * flow_mask).sum() / valid if valid > 0 else loss.new_zeros(())
+                loss = (
+                    (per_token_loss * flow_mask).sum() / valid
+                    if valid > 0 else per_token_loss.new_zeros(())
+                )
             else:
-                loss = loss.mean()
+                loss = per_token_loss.mean()
 
         if not compute_metrics:
             return loss
@@ -318,6 +334,31 @@ def myriad_make_train_fns(model, real_model, device, device_type, is_distributed
             metrics["flow_mag_gt"] = flow_target.norm(p=2, dim=-1).mean().detach()
             metrics["flow_mag_pred"] = samples.norm(p=2, dim=-1).mean().detach()
             metrics["frac_static_camera"] = batch["camera_static"].float().mean().detach()
+            collision_mask = batch.get("collision_token_mask")
+            if collision_mask is not None:
+                collision_mask = collision_mask.bool()
+                if collision_mask.shape != epe.shape:
+                    raise AssertionError(
+                        f"Collision token mask {collision_mask.shape} does not match EPE {epe.shape}"
+                    )
+                collision_count = collision_mask.sum()
+                noncollision_mask = ~collision_mask
+                noncollision_count = noncollision_mask.sum()
+                metrics["collision_token_fraction"] = collision_mask.float().mean().detach()
+                metrics["collision_loss"] = (
+                    (per_token_loss * collision_mask).sum() / collision_count.clamp_min(1)
+                ).detach()
+                metrics["collision_epe"] = (
+                    (epe * collision_mask).sum() / collision_count.clamp_min(1)
+                ).detach()
+                metrics["noncollision_loss"] = (
+                    (per_token_loss * noncollision_mask).sum() / noncollision_count.clamp_min(1)
+                ).detach()
+                metrics["noncollision_epe"] = (
+                    (epe * noncollision_mask).sum() / noncollision_count.clamp_min(1)
+                ).detach()
+            if flow_mask is not None:
+                metrics["mean_loss_weight"] = flow_mask.float().mean().detach()
 
         return loss, metrics
 
@@ -567,19 +608,36 @@ def _train(
             logger.info("Keyboard interrupt received, stopping training...")
             done = True
 
-        if done or (i % checkpoint_freq == 0 and rank == 0 and i > 0):
-            checkpoint = {
-                "model": real_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "step": start_step + i,
-                "train_mode": train_mode,
-                "git_commit": git_commit,
-            }
-            ckpt_dir = out_path / "checkpoints"
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(checkpoint, ckpt_dir / f"checkpoint_{start_step + i:07}.pt")
-            rank0logger.info(f"Saved checkpoint at step {start_step + i}.")
+        checkpoint_due = done or (i % checkpoint_freq == 0 and i > 0)
+        if checkpoint_due:
+            save_failed = False
+            if rank == 0:
+                checkpoint = {
+                    "model": real_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "step": start_step + i,
+                    "train_mode": train_mode,
+                    "git_commit": git_commit,
+                }
+                ckpt_dir = out_path / "checkpoints"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                destination = ckpt_dir / f"checkpoint_{start_step + i:07}.pt"
+                try:
+                    atomic_torch_save(checkpoint, destination)
+                    rank0logger.info(f"Saved checkpoint at step {start_step + i}.")
+                except (OSError, RuntimeError) as error:
+                    save_failed = True
+                    rank0logger.error(
+                        f"Checkpoint save failed at step {start_step + i}; stopping with the previous "
+                        f"checkpoint intact: {error}"
+                    )
+            if is_distributed:
+                failed_tensor = torch.tensor(int(save_failed), device=device)
+                dist.broadcast(failed_tensor, src=0)
+                save_failed = bool(failed_tensor.item())
+            if save_failed:
+                done = True
 
         if done:
             break
@@ -739,8 +797,13 @@ def train_billiards(batch_size, num_workers, nr_balls, frame_size, duration, dt,
 @click.option("--frame-size", default=512, show_default=True, type=int)
 @click.option("--duration", default=0.5, show_default=True, type=float)
 @click.option("--dt", default=0.01, show_default=True, type=float)
+@click.option("--collision-loss-weight", default=3.0, show_default=True, type=float,
+              help="Loss multiplier for balls affected by a collision.")
+@click.option("--collision-window-steps", default=10, show_default=True, type=int,
+              help="Also weight this many flow steps after each collision.")
 def train_billiards_physics(train_mode, unfreeze_last_n_layers, physics_bias_checkpoint_chunks,
-                            batch_size, num_workers, nr_balls, frame_size, duration, dt, **common_kwargs):
+                            batch_size, num_workers, nr_balls, frame_size, duration, dt,
+                            collision_loss_weight, collision_window_steps, **common_kwargs):
     """Train the separate MYRIAD billiards model with relation-MLP attention bias."""
     from myriad.model import MyriadStepByStep_Large_Billiard_PhysicsBias
     from myriad.data_billiards import BilliardSimDataModule
@@ -748,7 +811,14 @@ def train_billiards_physics(train_mode, unfreeze_last_n_layers, physics_bias_che
     data = BilliardSimDataModule(
         batch_size=batch_size,
         num_workers=num_workers,
-        train={"dataset_config": dict(nr_balls=nr_balls, frame_size=frame_size, duration=duration, dt=dt)},
+        train={"dataset_config": dict(
+            nr_balls=nr_balls,
+            frame_size=frame_size,
+            duration=duration,
+            dt=dt,
+            collision_loss_weight=collision_loss_weight,
+            collision_window_steps=collision_window_steps,
+        )},
     )
     physics_config = {
         "use_physics_bias": True,
@@ -758,6 +828,7 @@ def train_billiards_physics(train_mode, unfreeze_last_n_layers, physics_bias_che
         "physics_bias_max_abs": 1.0,
         "physics_bias_ball_radius": 0.033,
         "physics_bias_num_layers": 4,
+        "physics_bias_initial_scale": 0.5,
         "physics_bias_query_chunk_size": 64,
         "physics_bias_checkpoint_chunks": physics_bias_checkpoint_chunks,
     }
@@ -772,6 +843,8 @@ def train_billiards_physics(train_mode, unfreeze_last_n_layers, physics_bias_che
         num_workers=num_workers, nr_balls=nr_balls, frame_size=frame_size,
         duration=duration, dt=dt, train_mode=train_mode,
         unfreeze_last_n_layers=unfreeze_last_n_layers, **physics_config, **common_kwargs,
+        collision_loss_weight=collision_loss_weight,
+        collision_window_steps=collision_window_steps,
     )
     _train(
         data=data,

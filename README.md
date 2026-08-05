@@ -129,7 +129,9 @@ relative velocity, closing speed, signed ball-surface distance, time-to-closest-
 Query tokens are never used as velocity history, so neither targets nor future positions enter these features.
 
 The per-head relation output is zero-initialized and bounded to ±1 with tanh; image-token pairs receive zero bias,
-and the existing causal BlockMask remains authoritative. The normalized billiards radius is 0.033.
+and the existing causal BlockMask remains authoritative. Independent layer/head scales start at 0.5, which reduced
+fixed-scene EPE relative to 1.0 in the diagnostic sweep while remaining learnable. The normalized billiards radius
+is 0.033.
 
 Use --init-checkpoint to load the original model weights for a fresh optimization stage. Stage 1 trains the
 relation encoder and per-layer/per-head scales. Use the billiards-physics command with --train-mode physics-only
@@ -138,11 +140,16 @@ in eager mode. Stage 2 must be a new process and use --init-checkpoint with --tr
 Physics-bias training uses eager execution throughout. This avoids the Triton resource-limit failure observed when
 compiling the full 24-layer model on the RTX 5090.
 
-The default physics training launcher uses a 200-step warmup and saves a checkpoint every 500 steps.
+The default physics training launcher uses a 200-step warmup and saves a checkpoint every 500 steps. Ball-ball
+collision participants and their next 10 flow steps receive 3x loss weight; wall impacts are deliberately not
+upweighted because the relation encoder currently models ball-ball geometry. Configure this with
+`COLLISION_LOSS_WEIGHT` and `COLLISION_WINDOW_STEPS`. Checkpoints are written atomically, so a disk-full error
+keeps the previous checkpoint intact and stops training cleanly.
 
 The supplied training launcher writes TensorBoard events under `/root/tf-logs/flow-poke`, which is visible to the
 AutoDL TensorBoard service on port 6007. The `train/loss` series is written after every optimizer step; learning
-rate, gradient norm, evaluation metrics, allocated/reserved GPU memory, and compile/eager state are recorded too.
+rate, gradient norm, collision/non-collision loss and EPE, affected-token fraction, allocated/reserved GPU memory,
+and compile/eager state are recorded too.
 For a local server, run:
 
 ~~~shell

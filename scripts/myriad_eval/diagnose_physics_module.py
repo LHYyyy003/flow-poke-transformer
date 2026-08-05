@@ -106,6 +106,7 @@ def checkpoint_summary(path: Path | None) -> dict | None:
         "scale_mean": float(scales.mean()),
         "scale_std": float(scales.std()),
         "scale_max_deviation_from_one": float((scales - 1).abs().max()),
+        "scale_max_deviation_from_new_initial_half": float((scales - 0.5).abs().max()),
     }
 
 

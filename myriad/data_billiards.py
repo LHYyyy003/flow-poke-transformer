@@ -168,28 +168,104 @@ def simulate_billiard_game(
     bld: billiards.Billiard,
     duration: float,  # in seconds
     dt: float,  # in seconds,
-) -> tuple[list, list, list]:
+    return_ball_collision_mask: bool = False,
+) -> tuple:
     start_time = bld.time
     frames = int(duration / dt) + 1
     ts = []
     pos = []
     vel = []
     collisions = []
+    ball_collision_masks = []
+    participant_indices_available = []
     for i in range(frames):
         collision_result = bld.evolve(start_time + i * dt)
-        # billiards<0.5 returned two collision counts, while >=0.5 returns a
-        # list of collision records. The dataset only exposes a boolean and
-        # neither representation is consumed by the physics-bias model.
-        if (isinstance(collision_result, tuple) and len(collision_result) == 2
-                and all(isinstance(value, (int, np.integer)) for value in collision_result)):
+        # billiards<0.5 returned two collision counts, while >=0.5 returns
+        # records that identify the two balls in a ball-ball collision.
+        legacy_counts = (
+            isinstance(collision_result, tuple)
+            and len(collision_result) == 2
+            and all(isinstance(value, (int, np.integer)) for value in collision_result)
+        )
+        ball_mask = np.zeros(len(bld.balls_position), dtype=bool)
+        if legacy_counts:
             collision_occurred = collision_result[0] > 0 or collision_result[1] > 0
+            participant_indices_available.append(False)
         else:
             collision_occurred = len(collision_result) > 0
+            participant_indices_available.append(True)
+            for _, first_ball, second_object in collision_result:
+                # billiards 0.5 returns an integer second index only for a
+                # ball-ball impact; wall impacts return the obstacle object.
+                if isinstance(second_object, (int, np.integer)):
+                    ball_mask[int(first_ball)] = True
+                    ball_mask[int(second_object)] = True
         ts.append(bld.time)
         pos.append(bld.balls_position.copy())
         vel.append(bld.balls_velocity.copy())
         collisions.append(collision_occurred)
+        ball_collision_masks.append(ball_mask)
+
+    if not all(participant_indices_available):
+        # Legacy billiards releases expose only counts.  Velocity changes are
+        # the best available participant approximation in that API.
+        velocity_changes = np.zeros_like(np.asarray(ball_collision_masks))
+        velocity_changes[1:] = collision_token_mask_from_velocities(np.asarray(vel))
+        for index, available in enumerate(participant_indices_available):
+            if not available and collisions[index]:
+                ball_collision_masks[index] = velocity_changes[index]
+    if return_ball_collision_mask:
+        return ts, pos, vel, collisions, ball_collision_masks
     return ts, pos, vel, collisions
+
+
+def collision_token_mask_from_velocities(
+    velocities: np.ndarray,
+    window_steps: int = 0,
+    velocity_change_atol: float = 1e-5,
+) -> np.ndarray:
+    """Map velocity discontinuities to affected flow tokens.
+
+    ``velocities[t]`` is sampled after evolving to time ``t``.  A velocity
+    change between samples ``t`` and ``t + 1`` therefore belongs to flow token
+    ``t``.  The optional forward window keeps supervising the affected ball
+    after impact, where autoregressive rollout error starts accumulating.
+    """
+    velocities = np.asarray(velocities, dtype=np.float32)
+    if velocities.ndim != 3 or velocities.shape[-1] != 2:
+        raise ValueError(f"Expected velocities [T + 1, N, 2], got {velocities.shape}")
+    if velocities.shape[0] < 2:
+        raise ValueError("At least two velocity samples are required")
+    if window_steps < 0:
+        raise ValueError(f"window_steps must be non-negative, got {window_steps}")
+    if velocity_change_atol < 0:
+        raise ValueError("velocity_change_atol must be non-negative")
+
+    changed = np.linalg.norm(np.diff(velocities, axis=0), axis=-1) > velocity_change_atol
+    affected = changed.copy()
+    for offset in range(1, window_steps + 1):
+        affected[offset:] |= changed[:-offset]
+    return affected
+
+
+def expand_collision_window(mask: np.ndarray, window_steps: int) -> np.ndarray:
+    """Extend each affected ball token into subsequent rollout steps."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError(f"Expected collision mask [T, N], got {mask.shape}")
+    if window_steps < 0:
+        raise ValueError(f"window_steps must be non-negative, got {window_steps}")
+    expanded = mask.copy()
+    for offset in range(1, window_steps + 1):
+        expanded[offset:] |= mask[:-offset]
+    return expanded
+
+
+def collision_loss_weights(mask: np.ndarray, collision_weight: float) -> np.ndarray:
+    """Return normalized-loss weights without changing unselected tokens."""
+    if collision_weight < 1.0:
+        raise ValueError("collision_weight must be at least 1.0")
+    return np.where(np.asarray(mask, dtype=bool), collision_weight, 1.0).astype(np.float32)
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Visualization
@@ -266,6 +342,8 @@ class BilliardSimDataset(torch.utils.data.IterableDataset):
         dt: float = 0.05,
         p_moving: float = 0.25,
         return_full_video: bool = False,
+        collision_loss_weight: float = 1.0,
+        collision_window_steps: int = 0,
     ):
         super().__init__()
         self.frame_size = frame_size
@@ -275,6 +353,12 @@ class BilliardSimDataset(torch.utils.data.IterableDataset):
         self.dt = dt
         self.p_moving = p_moving
         self.return_full_video = return_full_video
+        if collision_loss_weight < 1.0:
+            raise ValueError("collision_loss_weight must be at least 1.0")
+        if collision_window_steps < 0:
+            raise ValueError("collision_window_steps must be non-negative")
+        self.collision_loss_weight = float(collision_loss_weight)
+        self.collision_window_steps = int(collision_window_steps)
 
         border_offset_range = np.array(border_offset_range)
         self.min_border_offset = max(math.floor(border_offset_range.min() * frame_size), 0)
@@ -290,7 +374,9 @@ class BilliardSimDataset(torch.utils.data.IterableDataset):
                 self.ball_radius,
                 self.p_moving,
             )
-            ts, pos, vel, collisions = simulate_billiard_game(bld, self.duration, self.dt)
+            ts, pos, vel, collisions, ball_collision_masks = simulate_billiard_game(
+                bld, self.duration, self.dt, return_ball_collision_mask=True
+            )
 
             if not self.return_full_video:
                 frame: Int[np.ndarray, "h w c"] = render_billiard_frame(
@@ -310,8 +396,17 @@ class BilliardSimDataset(torch.utils.data.IterableDataset):
             pos_norm = np.array(pos, dtype=np.float32) / self.frame_size
             flow = pos_norm[1:] - pos_norm[:-1]
             pos_norm = pos_norm[:-1]
+            # A collision returned while evolving to frame t occurred during
+            # flow interval t - 1. Frame zero has no preceding flow token.
+            collision_token_mask = expand_collision_window(
+                np.asarray(ball_collision_masks[1:]), self.collision_window_steps
+            )
 
             T, N_t, _ = flow.shape
+            if collision_token_mask.shape != (T, N_t):
+                raise AssertionError(
+                    f"Collision mask {collision_token_mask.shape} does not match flow {(T, N_t)}"
+                )
             pos_orig: Float[torch.Tensor, "t n_t 2"] = einops.repeat(pos_norm[0], "n_t c -> t n_t c", t=T)
             t: Float[torch.Tensor, "t n_t"] = einops.repeat(
                 torch.arange(T).float(), "t -> t n_t", n_t=N_t
@@ -340,7 +435,15 @@ class BilliardSimDataset(torch.utils.data.IterableDataset):
                 "timeskip": self.dt,
                 "border_offsets": torch.tensor(border_offsets),
                 "collisions": torch.tensor(collisions, dtype=torch.bool),
+                "collision_token_mask": einops.rearrange(
+                    torch.from_numpy(collision_token_mask), "t n_t -> (t n_t)"
+                ),
             }
+            if self.collision_loss_weight > 1.0:
+                weights = collision_loss_weights(collision_token_mask, self.collision_loss_weight)
+                result["flow_loss_mask"] = einops.rearrange(
+                    torch.from_numpy(weights), "t n_t -> (t n_t)"
+                )
             yield result
 
 

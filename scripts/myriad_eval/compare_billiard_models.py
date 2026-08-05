@@ -123,7 +123,13 @@ def fixed_scene() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[bool]]
     return image, truth, ts, collisions
 
 
-def load_model(kind: str, checkpoint_path: Path, device: torch.device):
+def load_model(
+    kind: str,
+    checkpoint_path: Path,
+    device: torch.device,
+    physics_max_abs: float | None = None,
+    physics_strength: float | None = None,
+):
     constructor = (
         MyriadStepByStep_Large_Billiard_PhysicsBias
         if kind.startswith("physics_bias")
@@ -142,6 +148,11 @@ def load_model(kind: str, checkpoint_path: Path, device: torch.device):
         for key, value in checkpoint["model"].items()
     }
     model.load_state_dict(state_dict, strict=True)
+    if kind.startswith("physics_bias") and physics_max_abs is not None:
+        model.transformer.physics_bias_generator.max_abs_bias = physics_max_abs
+    if kind.startswith("physics_bias") and physics_strength is not None:
+        with torch.no_grad():
+            model.transformer.physics_bias_generator.layer_head_scales.mul_(physics_strength)
     if kind == "physics_bias_disabled":
         model.transformer.use_physics_bias = False
     step = int(checkpoint.get("step", -1))
@@ -161,9 +172,17 @@ def evaluate_one(
     embed_repeats: int,
     rollout_warmup: int,
     rollout_repeats: int,
+    physics_max_abs: float | None = None,
+    physics_strength: float | None = None,
 ) -> tuple[dict, np.ndarray]:
     torch.cuda.empty_cache()
-    model, checkpoint_step, load_seconds = load_model(kind, checkpoint_path, device)
+    model, checkpoint_step, load_seconds = load_model(
+        kind,
+        checkpoint_path,
+        device,
+        physics_max_abs=physics_max_abs,
+        physics_strength=physics_strength,
+    )
     params = sum(parameter.numel() for parameter in model.parameters())
     image = image_cpu.to(device)
     truth = truth_cpu.to(device)
@@ -246,6 +265,18 @@ def main() -> None:
     parser.add_argument("--embed-repeats", type=int, default=10)
     parser.add_argument("--rollout-warmup", type=int, default=0)
     parser.add_argument("--rollout-repeats", type=int, default=2)
+    parser.add_argument(
+        "--physics-max-abs",
+        type=float,
+        default=None,
+        help="Override the checkpoint model's runtime physics-bias bound.",
+    )
+    parser.add_argument(
+        "--physics-strength",
+        type=float,
+        default=None,
+        help="Multiply all learned layer/head physics scales at evaluation time.",
+    )
     args = parser.parse_args()
 
     if not (args.dino_path / "config.json").is_file():
@@ -272,6 +303,8 @@ def main() -> None:
     physics, physics_prediction = evaluate_one(
         "physics_bias", args.physics, image, truth, ts, device,
         args.embed_repeats, args.rollout_warmup, args.rollout_repeats,
+        physics_max_abs=args.physics_max_abs,
+        physics_strength=args.physics_strength,
     )
     torch.cuda.reset_peak_memory_stats(device.index)
     physics_disabled, physics_disabled_prediction = evaluate_one(

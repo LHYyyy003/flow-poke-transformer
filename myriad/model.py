@@ -544,6 +544,7 @@ class PhysicsRelationBiasMLP(nn.Module):
         max_abs_bias: float = 1.0,
         ball_radius: float = 0.033,
         n_bias_layers: int = 4,
+        initial_layer_scale: float = 0.5,
         query_chunk_size: int = 64,
         checkpoint_chunks: bool = False,
     ):
@@ -556,6 +557,8 @@ class PhysicsRelationBiasMLP(nn.Module):
             raise ValueError("time_scale, max_abs_bias, and ball_radius must be positive")
         if n_bias_layers < 1:
             raise ValueError(f"n_bias_layers must be >= 1, got {n_bias_layers}")
+        if initial_layer_scale < 0:
+            raise ValueError("initial_layer_scale must be non-negative")
         self.n_heads = n_heads
         self.time_scale = float(time_scale)
         self.max_abs_bias = float(max_abs_bias)
@@ -574,7 +577,9 @@ class PhysicsRelationBiasMLP(nn.Module):
         self.mlp = nn.Sequential(*layers)
         # The physical feature encoder is shared, but every affected layer and
         # attention head can independently gate its contribution.
-        self.layer_head_scales = nn.Parameter(torch.ones(n_bias_layers, n_heads))
+        self.layer_head_scales = nn.Parameter(
+            torch.full((n_bias_layers, n_heads), float(initial_layer_scale))
+        )
 
     @staticmethod
     def _historical_velocity(
@@ -853,6 +858,7 @@ class FusedTransformer(nn.Module):
         physics_bias_max_abs: float = 1.0,
         physics_bias_ball_radius: float = 0.033,
         physics_bias_num_layers: int | None = None,
+        physics_bias_initial_scale: float = 0.5,
         physics_bias_query_chunk_size: int = 64,
         physics_bias_checkpoint_chunks: bool = False,
         # use_full_skip: bool = True,
@@ -916,6 +922,7 @@ class FusedTransformer(nn.Module):
                 max_abs_bias=physics_bias_max_abs,
                 ball_radius=physics_bias_ball_radius,
                 n_bias_layers=physics_bias_num_layers,
+                initial_layer_scale=physics_bias_initial_scale,
                 query_chunk_size=physics_bias_query_chunk_size,
                 checkpoint_chunks=physics_bias_checkpoint_chunks,
             ) if use_physics_bias else None
@@ -2079,6 +2086,7 @@ MyriadStepByStep_Large_Billiard_PhysicsBias = partial(
         "physics_bias_max_abs": 1.0,
         "physics_bias_ball_radius": 0.033,
         "physics_bias_num_layers": 4,
+        "physics_bias_initial_scale": 0.5,
         "physics_bias_query_chunk_size": 64,
         "physics_bias_checkpoint_chunks": False,
     },

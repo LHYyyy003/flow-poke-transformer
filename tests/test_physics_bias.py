@@ -26,8 +26,18 @@ def test_output_shape_and_finite():
 
 
 def test_zero_initialization():
-    bias = PhysicsRelationBiasMLP(8)(*metadata())
+    module = PhysicsRelationBiasMLP(8)
+    bias = module(*metadata())
     torch.testing.assert_close(bias, torch.zeros_like(bias), atol=0, rtol=0)
+    torch.testing.assert_close(
+        module.layer_head_scales,
+        torch.full_like(module.layer_head_scales, 0.5),
+    )
+
+
+def test_negative_initial_layer_scale_is_rejected():
+    with pytest.raises(ValueError, match="initial_layer_scale"):
+        PhysicsRelationBiasMLP(8, initial_layer_scale=-0.1)
 
 
 def test_chunking_and_checkpoint_are_equivalent():
