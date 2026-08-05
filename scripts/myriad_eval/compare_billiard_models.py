@@ -147,6 +147,14 @@ def load_model(
         ): value
         for key, value in checkpoint["model"].items()
     }
+    physics_input_key = "transformer.physics_bias_generator.mlp.0.weight"
+    if physics_input_key in state_dict:
+        source = state_dict[physics_input_key]
+        target = model.state_dict()[physics_input_key]
+        if source.shape[:-1] == target.shape[:-1] and source.shape[-1] < target.shape[-1]:
+            expanded = source.new_zeros(target.shape)
+            expanded[..., :source.shape[-1]] = source
+            state_dict[physics_input_key] = expanded
     model.load_state_dict(state_dict, strict=True)
     if kind.startswith("physics_bias") and physics_max_abs is not None:
         model.transformer.physics_bias_generator.max_abs_bias = physics_max_abs
@@ -174,6 +182,7 @@ def evaluate_one(
     rollout_repeats: int,
     physics_max_abs: float | None = None,
     physics_strength: float | None = None,
+    oracle_history: bool = False,
 ) -> tuple[dict, np.ndarray]:
     torch.cuda.empty_cache()
     model, checkpoint_step, load_seconds = load_model(
@@ -210,14 +219,39 @@ def evaluate_one(
         # Accuracy prediction uses the same RF sampling seed for both models.
         rollout()
         prediction = holder["prediction"].float()
+        oracle_prediction = None
+        if oracle_history:
+            seed_everything(SEED)
+            oracle_prediction = model.predict_simulate(
+                n_traj=N_BALLS,
+                ts=ts,
+                given_pos=given_pos,
+                camera_static=camera_static,
+                d_img=d_img,
+                verbose=False,
+                teacher_forcing_pos=truth,
+            ).float()
         seed_everything(SEED + 1)
         rollout_times = timed_cuda(rollout, warmup=rollout_warmup, repeats=rollout_repeats)
 
-    predicted_region = prediction[:, GIVEN_STEPS:]
     truth_region = truth[:, GIVEN_STEPS:]
-    epe_px = torch.linalg.vector_norm(predicted_region - truth_region, dim=-1) * FRAME_SIZE
-    per_timestep_px = epe_px.mean(dim=(0, 2))
-    all_errors = epe_px.flatten()
+
+    def accuracy_metrics(candidate: torch.Tensor) -> dict:
+        epe_px = torch.linalg.vector_norm(
+            candidate[:, GIVEN_STEPS:] - truth_region, dim=-1
+        ) * FRAME_SIZE
+        all_errors = epe_px.flatten()
+        return {
+            "mean_epe_px": float(all_errors.mean()),
+            "median_epe_px": float(all_errors.median()),
+            "p95_epe_px": float(torch.quantile(all_errors, 0.95)),
+            "final_step_mean_epe_px": float(epe_px[:, -1].mean()),
+            "moving_ball_0_mean_epe_px": float(epe_px[:, :, 0].mean()),
+            "collision_target_ball_1_mean_epe_px": float(epe_px[:, :, 1].mean()),
+            "per_timestep_mean_epe_px": epe_px.mean(dim=(0, 2)).cpu().tolist(),
+        }
+
+    accuracy = accuracy_metrics(prediction)
     rollout_summary = summarize_ms(rollout_times)
     predicted_tokens = (truth.shape[1] - GIVEN_STEPS) * N_BALLS
     rollout_summary["predicted_motion_tokens"] = predicted_tokens
@@ -228,15 +262,7 @@ def evaluate_one(
         "checkpoint_step": checkpoint_step,
         "checkpoint_bytes": checkpoint_path.stat().st_size,
         "parameters": params,
-        "accuracy": {
-            "mean_epe_px": float(all_errors.mean()),
-            "median_epe_px": float(all_errors.median()),
-            "p95_epe_px": float(torch.quantile(all_errors, 0.95)),
-            "final_step_mean_epe_px": float(epe_px[:, -1].mean()),
-            "moving_ball_0_mean_epe_px": float(epe_px[:, :, 0].mean()),
-            "collision_target_ball_1_mean_epe_px": float(epe_px[:, :, 1].mean()),
-            "per_timestep_mean_epe_px": per_timestep_px.cpu().tolist(),
-        },
+        "accuracy": accuracy,
         "efficiency": {
             "model_load_seconds": load_seconds,
             "image_embedding": summarize_ms(embed_times),
@@ -244,8 +270,10 @@ def evaluate_one(
             "peak_allocated_vram_gib_including_model": torch.cuda.max_memory_allocated(device.index) / 1024**3,
         },
     }
+    if oracle_prediction is not None:
+        result["oracle_history_accuracy"] = accuracy_metrics(oracle_prediction)
     prediction_np = prediction.cpu().numpy()
-    del model, image, truth, ts, given_pos, d_img, prediction, holder
+    del model, image, truth, ts, given_pos, d_img, prediction, oracle_prediction, holder
     gc.collect()
     torch.cuda.empty_cache()
     return result, prediction_np
@@ -277,6 +305,11 @@ def main() -> None:
         default=None,
         help="Multiply all learned layer/head physics scales at evaluation time.",
     )
+    parser.add_argument(
+        "--oracle-history",
+        action="store_true",
+        help="Also measure predictions while feeding ground-truth history.",
+    )
     args = parser.parse_args()
 
     if not (args.dino_path / "config.json").is_file():
@@ -298,6 +331,7 @@ def main() -> None:
     original, original_prediction = evaluate_one(
         "original", args.original, image, truth, ts, device,
         args.embed_repeats, args.rollout_warmup, args.rollout_repeats,
+        oracle_history=args.oracle_history,
     )
     torch.cuda.reset_peak_memory_stats(device.index)
     physics, physics_prediction = evaluate_one(
@@ -305,11 +339,13 @@ def main() -> None:
         args.embed_repeats, args.rollout_warmup, args.rollout_repeats,
         physics_max_abs=args.physics_max_abs,
         physics_strength=args.physics_strength,
+        oracle_history=args.oracle_history,
     )
     torch.cuda.reset_peak_memory_stats(device.index)
     physics_disabled, physics_disabled_prediction = evaluate_one(
         "physics_bias_disabled", args.physics, image, truth, ts, device,
         args.embed_repeats, args.rollout_warmup, args.rollout_repeats,
+        oracle_history=args.oracle_history,
     )
 
     original_epe = original["accuracy"]["mean_epe_px"]

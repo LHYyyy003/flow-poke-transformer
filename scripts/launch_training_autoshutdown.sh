@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Launch training detached from SSH. On successful completion, power off this
-# ordinary AutoDL instance locally. Failed/interrupted training stays online.
+# Launch training detached from SSH. Power off this ordinary AutoDL instance
+# locally after either successful completion or a training error.
 
 set -euo pipefail
 
@@ -34,11 +34,6 @@ bash "${RUNNER}"
 train_status=$?
 set -e
 
-if [[ ${train_status} -ne 0 ]]; then
-  echo "Training ended with status ${train_status}; instance will remain running." >&2
-  exit "${train_status}"
-fi
-
-echo "Training completed successfully; powering off this AutoDL instance..."
+echo "Training ended with status ${train_status}; powering off this AutoDL instance..."
 sync
 exec ${SHUTDOWN_COMMAND}

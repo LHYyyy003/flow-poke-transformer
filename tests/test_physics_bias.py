@@ -82,6 +82,43 @@ def test_historical_velocity_ignores_query_tokens():
     torch.testing.assert_close(velocity, torch.tensor([[[1.0, 0.0]]]))
 
 
+def test_long_history_recovers_constant_velocity_and_zero_acceleration():
+    history_time = torch.arange(6).float().unsqueeze(0)
+    history_pos = torch.stack((0.2 * history_time, -0.1 * history_time), dim=-1)
+    velocity, acceleration = PhysicsRelationBiasMLP._historical_kinematics(
+        pos=torch.tensor([[[1.2, -0.6]]]),
+        time=torch.tensor([[6.0]]),
+        track=torch.tensor([[0]]),
+        history_pos=history_pos,
+        history_time=history_time,
+        history_track=torch.zeros_like(history_time, dtype=torch.long),
+        history_is_query=torch.zeros_like(history_time, dtype=torch.bool),
+        history_window=6,
+    )
+    torch.testing.assert_close(velocity, torch.tensor([[[0.2, -0.1]]]), atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(acceleration, torch.zeros_like(acceleration), atol=1e-4, rtol=1e-4)
+
+
+def test_long_history_recovers_acceleration():
+    history_time = torch.arange(5).float().unsqueeze(0)
+    x = 0.1 * history_time + 0.5 * 0.02 * history_time.square()
+    history_pos = torch.stack((x, torch.zeros_like(x)), dim=-1)
+    current_t = torch.tensor([[5.0]])
+    current_x = 0.1 * current_t + 0.5 * 0.02 * current_t.square()
+    velocity, acceleration = PhysicsRelationBiasMLP._historical_kinematics(
+        pos=torch.stack((current_x, torch.zeros_like(current_x)), dim=-1),
+        time=current_t,
+        track=torch.tensor([[0]]),
+        history_pos=history_pos,
+        history_time=history_time,
+        history_track=torch.zeros_like(history_time, dtype=torch.long),
+        history_is_query=torch.zeros_like(history_time, dtype=torch.bool),
+        history_window=5,
+    )
+    torch.testing.assert_close(velocity, torch.tensor([[[0.2, 0.0]]]), atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(acceleration, torch.tensor([[[0.02, 0.0]]]), atol=1e-4, rtol=1e-4)
+
+
 def test_historical_relation_features_do_not_leak_future_positions():
     module = PhysicsRelationBiasMLP(2)
     with torch.no_grad():
@@ -311,6 +348,23 @@ def test_old_five_feature_physics_checkpoint_can_initialize(tmp_path):
     )
     torch.testing.assert_close(
         new.state_dict()[input_key][..., 5:], torch.zeros_like(new.state_dict()[input_key][..., 5:])
+    )
+
+
+def test_old_eleven_feature_physics_checkpoint_can_initialize(tmp_path):
+    old = TinyModel(physics=True)
+    state = old.state_dict()
+    input_key = "transformer.physics_bias_generator.mlp.0.weight"
+    state[input_key] = state[input_key][..., :11].clone()
+    path = tmp_path / "old_eleven_feature_physics.pt"
+    torch.save({"model": state}, path)
+
+    new = TinyModel(physics=True)
+    incompatible = load_init_checkpoint(new, path)
+    assert not incompatible.missing_keys
+    torch.testing.assert_close(new.state_dict()[input_key][..., :11], state[input_key])
+    torch.testing.assert_close(
+        new.state_dict()[input_key][..., 11:], torch.zeros_like(new.state_dict()[input_key][..., 11:])
     )
 
 

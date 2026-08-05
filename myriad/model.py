@@ -545,6 +545,8 @@ class PhysicsRelationBiasMLP(nn.Module):
         ball_radius: float = 0.033,
         n_bias_layers: int = 4,
         initial_layer_scale: float = 0.5,
+        history_window: int = 8,
+        history_decay: float = 4.0,
         query_chunk_size: int = 64,
         checkpoint_chunks: bool = False,
     ):
@@ -559,18 +561,23 @@ class PhysicsRelationBiasMLP(nn.Module):
             raise ValueError(f"n_bias_layers must be >= 1, got {n_bias_layers}")
         if initial_layer_scale < 0:
             raise ValueError("initial_layer_scale must be non-negative")
+        if history_window < 2:
+            raise ValueError("history_window must be at least 2")
+        if history_decay <= 0:
+            raise ValueError("history_decay must be positive")
         self.n_heads = n_heads
         self.time_scale = float(time_scale)
         self.max_abs_bias = float(max_abs_bias)
         self.ball_radius = float(ball_radius)
         self.n_bias_layers = n_bias_layers
+        self.history_window = int(history_window)
+        self.history_decay = float(history_decay)
         self.query_chunk_size = query_chunk_size
         self.checkpoint_chunks = checkpoint_chunks
 
-        # Keep the original five relation inputs first, then append causal
-        # kinematics: relative velocity (2), closing speed, signed surface
-        # distance, time to closest approach, and an approaching indicator.
-        layers: list[nn.Module] = [nn.Linear(11, hidden_dim), nn.SiLU()]
+        # Keep the original 11 relation inputs first, then append causal
+        # long-history acceleration (2) and radial closing acceleration.
+        layers: list[nn.Module] = [nn.Linear(14, hidden_dim), nn.SiLU()]
         for _ in range(depth - 1):
             layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SiLU()])
         layers.append(zero_init(nn.Linear(hidden_dim, n_heads)))
@@ -582,6 +589,66 @@ class PhysicsRelationBiasMLP(nn.Module):
         )
 
     @staticmethod
+    def _historical_kinematics(
+        pos: torch.Tensor,
+        time: torch.Tensor,
+        track: torch.Tensor,
+        history_pos: torch.Tensor,
+        history_time: torch.Tensor,
+        history_track: torch.Tensor,
+        history_is_query: torch.Tensor,
+        history_window: int = 8,
+        history_decay: float = 4.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fit causal velocity/acceleration from recent same-track positions."""
+        same_track = track[:, :, None] == history_track[:, None, :]
+        earlier = history_time[:, None, :] < time[:, :, None]
+        observed = ~history_is_query[:, None, :]
+        valid = same_track & earlier & observed
+
+        candidate_time = history_time[:, None, :].expand(-1, pos.size(1), -1)
+        candidate_time = candidate_time.masked_fill(~valid, float("-inf"))
+        window = min(history_window, history_pos.size(1))
+        selected_time, selected_idx = candidate_time.topk(window, dim=-1)
+        selected_valid = torch.isfinite(selected_time)
+        expanded_history = history_pos[:, None].expand(-1, pos.size(1), -1, -1)
+        selected_pos = torch.gather(
+            expanded_history, 2, selected_idx[..., None].expand(-1, -1, -1, 2)
+        )
+
+        # Anchor a weighted quadratic at the current position:
+        # p(t + dt) - p(t) = velocity * dt + 0.5 * acceleration * dt^2.
+        # Recent samples receive more weight so collision discontinuities do not
+        # get averaged over the entire rollout.
+        fit_dtype = torch.float32
+        dt = (selected_time - time[..., None]).to(fit_dtype)
+        dt = torch.where(selected_valid, dt, torch.zeros_like(dt))
+        y = (selected_pos - pos[:, :, None]).to(fit_dtype)
+        weights = torch.exp(dt / history_decay) * selected_valid.to(fit_dtype)
+        x1 = dt
+        x2 = 0.5 * dt.square()
+        a11 = (weights * x1.square()).sum(dim=-1)
+        a12 = (weights * x1 * x2).sum(dim=-1)
+        a22 = (weights * x2.square()).sum(dim=-1)
+        b1 = (weights[..., None] * x1[..., None] * y).sum(dim=-2)
+        b2 = (weights[..., None] * x2[..., None] * y).sum(dim=-2)
+        determinant = a11 * a22 - a12.square()
+        stable = (selected_valid.sum(dim=-1) >= 2) & (determinant.abs() > 1e-8)
+        safe_determinant = determinant.masked_fill(~stable, 1.0)
+        velocity_fit = (b1 * a22[..., None] - b2 * a12[..., None]) / safe_determinant[..., None]
+        acceleration_fit = (b2 * a11[..., None] - b1 * a12[..., None]) / safe_determinant[..., None]
+
+        latest_valid = selected_valid[..., 0]
+        latest_dt = (time - selected_time[..., 0]).clamp_min(1e-6)
+        latest_velocity = (pos - selected_pos[..., 0, :]) / latest_dt[..., None]
+        latest_velocity = torch.where(latest_valid[..., None], latest_velocity, torch.zeros_like(pos))
+        velocity = torch.where(stable[..., None], velocity_fit.to(pos.dtype), latest_velocity)
+        acceleration = torch.where(
+            stable[..., None], acceleration_fit.to(pos.dtype), torch.zeros_like(pos)
+        )
+        return velocity.clamp(-1.0, 1.0), acceleration.clamp(-1.0, 1.0)
+
+    @staticmethod
     def _historical_velocity(
         pos: torch.Tensor,
         time: torch.Tensor,
@@ -591,21 +658,11 @@ class PhysicsRelationBiasMLP(nn.Module):
         history_track: torch.Tensor,
         history_is_query: torch.Tensor,
     ) -> torch.Tensor:
-        """Finite-difference velocity using the latest earlier observed token."""
-        same_track = track[:, :, None] == history_track[:, None, :]
-        earlier = history_time[:, None, :] < time[:, :, None]
-        observed = ~history_is_query[:, None, :]
-        valid = same_track & earlier & observed
-
-        candidate_time = history_time[:, None, :].expand(-1, pos.size(1), -1)
-        candidate_time = candidate_time.masked_fill(~valid, float("-inf"))
-        previous_time, previous_idx = candidate_time.max(dim=-1)
-        has_history = valid.any(dim=-1)
-        gather_idx = previous_idx[..., None].expand(-1, -1, 2)
-        previous_pos = torch.gather(history_pos, 1, gather_idx)
-        dt = (time - previous_time).clamp_min(1e-6)
-        velocity = (pos - previous_pos) / dt[..., None]
-        return torch.where(has_history[..., None], velocity, torch.zeros_like(velocity))
+        """Backward-compatible velocity-only view of the history estimator."""
+        velocity, _ = PhysicsRelationBiasMLP._historical_kinematics(
+            pos, time, track, history_pos, history_time, history_track, history_is_query
+        )
+        return velocity
 
     def _chunk(
         self,
@@ -615,6 +672,10 @@ class PhysicsRelationBiasMLP(nn.Module):
         pos_k: torch.Tensor,
         time_k: torch.Tensor,
         track_k: torch.Tensor,
+        velocity_q: torch.Tensor,
+        acceleration_q: torch.Tensor,
+        velocity_k: torch.Tensor,
+        acceleration_k: torch.Tensor,
         is_query_q: torch.Tensor,
         is_query_k: torch.Tensor,
     ) -> torch.Tensor:
@@ -623,13 +684,8 @@ class PhysicsRelationBiasMLP(nn.Module):
         delta_time = (time_q[:, :, None] - time_k[:, None, :]).unsqueeze(-1)
         delta_time = torch.clamp(delta_time / self.time_scale, min=-1.0, max=1.0)
         same_track = (track_q[:, :, None] == track_k[:, None, :]).unsqueeze(-1).to(rel_pos.dtype)
-        velocity_q = self._historical_velocity(
-            pos_q, time_q, track_q, pos_k, time_k, track_k, is_query_k
-        )
-        velocity_k = self._historical_velocity(
-            pos_k, time_k, track_k, pos_k, time_k, track_k, is_query_k
-        )
         rel_velocity = velocity_k[:, None, :, :] - velocity_q[:, :, None, :]
+        rel_acceleration = acceleration_k[:, None, :, :] - acceleration_q[:, :, None, :]
         radial_velocity = (rel_pos * rel_velocity).sum(dim=-1, keepdim=True)
         closing_speed = -radial_velocity / distance.clamp_min(1e-6)
         surface_distance = distance - 2.0 * self.ball_radius
@@ -637,11 +693,13 @@ class PhysicsRelationBiasMLP(nn.Module):
         t_closest = -radial_velocity / relative_speed_sq.clamp_min(1e-8)
         t_closest = torch.clamp(t_closest / self.time_scale, min=-1.0, max=1.0)
         approaching = (closing_speed > 0).to(rel_pos.dtype)
+        closing_acceleration = -(rel_pos * rel_acceleration).sum(dim=-1, keepdim=True) / distance.clamp_min(1e-6)
         features = torch.cat([
             rel_pos, distance, delta_time.to(rel_pos.dtype), same_track,
             rel_velocity, closing_speed, surface_distance, t_closest, approaching,
+            rel_acceleration, closing_acceleration,
         ], dim=-1)
-        assert features.shape[-1] == 11
+        assert features.shape[-1] == 14
         raw_bias = self.mlp(features)
         bias = self.max_abs_bias * torch.tanh(raw_bias / self.max_abs_bias)
         return bias.permute(0, 3, 1, 2).contiguous()
@@ -656,10 +714,20 @@ class PhysicsRelationBiasMLP(nn.Module):
             is_query_q = torch.zeros_like(track_q, dtype=torch.bool)
         if is_query_k is None:
             is_query_k = torch.zeros_like(track_k, dtype=torch.bool)
+        velocity_q, acceleration_q = self._historical_kinematics(
+            pos_q, time_q, track_q, pos_k, time_k, track_k, is_query_k,
+            self.history_window, self.history_decay,
+        )
+        velocity_k, acceleration_k = self._historical_kinematics(
+            pos_k, time_k, track_k, pos_k, time_k, track_k, is_query_k,
+            self.history_window, self.history_decay,
+        )
         chunks = []
         for start in range(0, pos_q.size(1), self.query_chunk_size):
             args = (pos_q[:, start : start + self.query_chunk_size], time_q[:, start : start + self.query_chunk_size],
                     track_q[:, start : start + self.query_chunk_size], pos_k, time_k, track_k,
+                    velocity_q[:, start : start + self.query_chunk_size],
+                    acceleration_q[:, start : start + self.query_chunk_size], velocity_k, acceleration_k,
                     is_query_q[:, start : start + self.query_chunk_size], is_query_k)
             if self.checkpoint_chunks and self.training:
                 chunk_bias = checkpoint(self._chunk, *args, use_reentrant=False)
@@ -859,6 +927,8 @@ class FusedTransformer(nn.Module):
         physics_bias_ball_radius: float = 0.033,
         physics_bias_num_layers: int | None = None,
         physics_bias_initial_scale: float = 0.5,
+        physics_bias_history_window: int = 8,
+        physics_bias_history_decay: float = 4.0,
         physics_bias_query_chunk_size: int = 64,
         physics_bias_checkpoint_chunks: bool = False,
         # use_full_skip: bool = True,
@@ -923,6 +993,8 @@ class FusedTransformer(nn.Module):
                 ball_radius=physics_bias_ball_radius,
                 n_bias_layers=physics_bias_num_layers,
                 initial_layer_scale=physics_bias_initial_scale,
+                history_window=physics_bias_history_window,
+                history_decay=physics_bias_history_decay,
                 query_chunk_size=physics_bias_query_chunk_size,
                 checkpoint_chunks=physics_bias_checkpoint_chunks,
             ) if use_physics_bias else None
@@ -1858,6 +1930,7 @@ class MyriadStepByStep(nn.Module):
         d_img: dict[str, torch.Tensor],
         verbose: bool = True,
         d_steps: int | None = None,
+        teacher_forcing_pos: Float[torch.Tensor, "b t n_traj 2"] | None = None,
     ) -> Float[torch.Tensor, "b t n_traj 2"]:
         is_fm = isinstance(self.distribution_head, RFHeadDistributionOutput)
 
@@ -1887,6 +1960,16 @@ class MyriadStepByStep(nn.Module):
         pos: Float[torch.Tensor, "b t n c"] = given_pos.new_zeros((B, T, N_traj, C))
         # prefill known positions
         pos.view(B, T * N_traj, C)[:, :L_known] = given_pos
+        prediction = pos.clone() if teacher_forcing_pos is not None else pos
+        if teacher_forcing_pos is not None:
+            if teacher_forcing_pos.shape != pos.shape:
+                raise ValueError(
+                    f"{teacher_forcing_pos.shape=} must match rollout shape {pos.shape}"
+                )
+            if teacher_forcing_pos.device != device:
+                raise ValueError(
+                    f"{teacher_forcing_pos.device=} must match rollout device {device}"
+                )
 
         # Helper tensors
         pos_orig: Float[torch.Tensor, "b (t n) c"] = einops.repeat(pos[:, 0], "b n c -> b (t n) c", t=T)
@@ -1981,8 +2064,15 @@ class MyriadStepByStep(nn.Module):
             if is_fm:
                 dist.steps = rf_steps
             delta = dist.sample().squeeze(1)
-            pos[:, i_t + 1, i_traj] = pos[:, i_t, i_traj] + delta
-        return pos
+            next_pos = pos[:, i_t, i_traj] + delta
+            prediction[:, i_t + 1, i_traj] = next_pos
+            if teacher_forcing_pos is None:
+                pos[:, i_t + 1, i_traj] = next_pos
+            else:
+                # Oracle-history diagnostic: retain the actual one-step prediction,
+                # but put ground truth into the autoregressive cache for later tokens.
+                pos[:, i_t + 1, i_traj] = teacher_forcing_pos[:, i_t + 1, i_traj]
+        return prediction
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Model Configurations
@@ -2087,6 +2177,8 @@ MyriadStepByStep_Large_Billiard_PhysicsBias = partial(
         "physics_bias_ball_radius": 0.033,
         "physics_bias_num_layers": 4,
         "physics_bias_initial_scale": 0.5,
+        "physics_bias_history_window": 8,
+        "physics_bias_history_decay": 4.0,
         "physics_bias_query_chunk_size": 64,
         "physics_bias_checkpoint_chunks": False,
     },

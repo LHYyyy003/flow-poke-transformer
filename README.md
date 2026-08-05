@@ -124,9 +124,14 @@ last four of the 24 Transformer layers. The relation encoder is shared, while ev
 head has an independent learned scale.
 
 Its inputs retain the original relative position, center distance, time difference, and same-track indicator, and
-add causal finite-difference kinematics derived from the latest earlier observed position of the same ball:
+add causal kinematics derived from earlier observed positions of the same ball:
 relative velocity, closing speed, signed ball-surface distance, time-to-closest-approach, and an approaching flag.
 Query tokens are never used as velocity history, so neither targets nor future positions enter these features.
+
+The current physics model replaces the single-frame velocity difference with a causal weighted quadratic fit over
+the latest eight same-track states. This supplies smoothed velocity, acceleration, relative acceleration, and radial
+closing acceleration to the relation MLP. Recent states receive higher weight, preserving responsiveness around
+collisions while reducing autoregressive velocity noise. The fit uses only earlier non-query tokens.
 
 The per-head relation output is zero-initialized and bounded to ±1 with tanh; image-token pairs receive zero bias,
 and the existing causal BlockMask remains authoritative. Independent layer/head scales start at 0.5, which reduced
@@ -140,7 +145,8 @@ in eager mode. Stage 2 must be a new process and use --init-checkpoint with --tr
 Physics-bias training uses eager execution throughout. This avoids the Triton resource-limit failure observed when
 compiling the full 24-layer model on the RTX 5090.
 
-The default physics training launcher uses a 200-step warmup and saves a checkpoint every 500 steps. Ball-ball
+The default physics training launcher runs 1500 optimizer steps, uses a 200-step warmup, and saves a checkpoint
+every 500 steps. Ball-ball
 collision participants and their next 10 flow steps receive 3x loss weight; wall impacts are deliberately not
 upweighted because the relation encoder currently models ball-ball geometry. Configure this with
 `COLLISION_LOSS_WEIGHT` and `COLLISION_WINDOW_STEPS`. Checkpoints are written atomically, so a disk-full error

@@ -96,17 +96,18 @@ def load_init_checkpoint(model, path):
     state_dict = _strip_uniform_module_prefix(state_dict)
     state_dict = _remap_modelscope_dinov3_layer_keys(model, state_dict)
 
-    # Physics-bias checkpoints created before causal kinematics used five MLP
-    # inputs. Preserve those columns and initialize the six new features to
-    # zero so they can be safely fine-tuned with --init-checkpoint.
+    # Preserve older relation columns and zero-initialize newly added causal
+    # kinematics so 5- and 11-feature physics checkpoints remain loadable.
     physics_input_key = "transformer.physics_bias_generator.mlp.0.weight"
     target_state = model.state_dict()
     if physics_input_key in state_dict and physics_input_key in target_state:
         source = state_dict[physics_input_key]
         target = target_state[physics_input_key]
-        if source.shape[:-1] == target.shape[:-1] and source.shape[-1] == 5 and target.shape[-1] == 11:
+        if (source.shape[:-1] == target.shape[:-1]
+                and source.shape[-1] in (5, 11)
+                and source.shape[-1] < target.shape[-1]):
             expanded = source.new_zeros(target.shape)
-            expanded[..., :5] = source
+            expanded[..., :source.shape[-1]] = source
             state_dict[physics_input_key] = expanded
 
     incompatible = model.load_state_dict(state_dict, strict=False)
@@ -544,6 +545,7 @@ def _train(
     for i, batch in enumerate(
         pbar := tqdm(endless_iter(train_loader), desc="Training", disable=rank != 0, initial=start_step)
     ):
+        global_step = start_step + i + 1
         try:
             if not caches_initialized:
                 block_mask, is_query, L_poke = init_caches(batch)
@@ -591,7 +593,6 @@ def _train(
                 }
 
             pbar.set_postfix(train_meta)
-            global_step = start_step + i
             if tensorboard_writer is not None:
                 for key, value in train_meta.items():
                     tensorboard_writer.add_scalar(f"train/{key}", value, global_step)
@@ -600,15 +601,15 @@ def _train(
                 import wandb
                 wandb.log({f"train/{k}": v for k, v in train_meta.items()}, step=global_step)
 
-            done = max_steps is not None and (start_step + i) >= max_steps
+            done = max_steps is not None and global_step >= max_steps
             if done:
-                rank0logger.info(f"Reached max steps: {start_step + i} >= {max_steps}. Stopping training...")
+                rank0logger.info(f"Reached max steps: {global_step} >= {max_steps}. Stopping training...")
 
         except KeyboardInterrupt:
             logger.info("Keyboard interrupt received, stopping training...")
             done = True
 
-        checkpoint_due = done or (i % checkpoint_freq == 0 and i > 0)
+        checkpoint_due = done or (global_step % checkpoint_freq == 0)
         if checkpoint_due:
             save_failed = False
             if rank == 0:
@@ -616,16 +617,16 @@ def _train(
                     "model": real_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
-                    "step": start_step + i,
+                    "step": global_step,
                     "train_mode": train_mode,
                     "git_commit": git_commit,
                 }
                 ckpt_dir = out_path / "checkpoints"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
-                destination = ckpt_dir / f"checkpoint_{start_step + i:07}.pt"
+                destination = ckpt_dir / f"checkpoint_{global_step:07}.pt"
                 try:
                     atomic_torch_save(checkpoint, destination)
-                    rank0logger.info(f"Saved checkpoint at step {start_step + i}.")
+                    rank0logger.info(f"Saved checkpoint at step {global_step}.")
                 except (OSError, RuntimeError) as error:
                     save_failed = True
                     rank0logger.error(
@@ -829,6 +830,8 @@ def train_billiards_physics(train_mode, unfreeze_last_n_layers, physics_bias_che
         "physics_bias_ball_radius": 0.033,
         "physics_bias_num_layers": 4,
         "physics_bias_initial_scale": 0.5,
+        "physics_bias_history_window": 8,
+        "physics_bias_history_decay": 4.0,
         "physics_bias_query_chunk_size": 64,
         "physics_bias_checkpoint_chunks": physics_bias_checkpoint_chunks,
     }
