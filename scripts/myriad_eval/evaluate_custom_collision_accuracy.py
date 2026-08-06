@@ -180,8 +180,14 @@ def main():
     parser.add_argument("--original", type=Path, required=True)
     parser.add_argument("--physics-500", type=Path, required=True)
     parser.add_argument("--long-history-500", type=Path, required=True)
-    parser.add_argument("--gated-long-history", type=Path, default=None,
-                        help="Optional trained long-history checkpoint with cross-track gating")
+    parser.add_argument(
+        "--gated-long-history", type=Path, action="append", default=None,
+        help="Optional trained long-history checkpoint with cross-track gating; repeat for multiple steps",
+    )
+    parser.add_argument(
+        "--only-gated", action="store_true",
+        help="Evaluate only the repeated --gated-long-history checkpoints",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dino-path", type=Path, required=True)
     parser.add_argument("--scenes-per-category", type=int, default=10)
@@ -194,27 +200,30 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.init()
     models = {}
-    models["original"] = load_model("original", args.original, device)[0]
-    models["physics_only_500_strength025"] = load_model(
-        "physics_bias", args.physics_500, device, physics_strength=0.25,
-        physics_kinematics_mode="short",
-    )[0]
-    models["long_history_only_500"] = load_model(
-        "long_history_bias", args.long_history_500, device,
-        physics_kinematics_mode="temporal-only",
-    )[0]
-    # The repository's trained collision-smooth checkpoint is the production
-    # combined variant: physical relation features plus causal long-history
-    # kinematics inside the same bias module.
-    models["combined_500"] = load_model(
-        "physics_bias", args.physics_500, device, physics_strength=0.25,
-        physics_kinematics_mode="collision-smooth",
-    )[0]
-    if args.gated_long_history is not None:
-        models["long_history_gated_500"] = load_model(
-            "long_history_bias", args.gated_long_history, device,
+    if not args.only_gated:
+        models["original"] = load_model("original", args.original, device)[0]
+        models["physics_only_500_strength025"] = load_model(
+            "physics_bias", args.physics_500, device, physics_strength=0.25,
+            physics_kinematics_mode="short",
+        )[0]
+        models["long_history_only_500"] = load_model(
+            "long_history_bias", args.long_history_500, device,
             physics_kinematics_mode="temporal-only",
         )[0]
+        # The repository's trained collision-smooth checkpoint is the production
+        # combined variant: physical relation features plus causal long-history
+        # kinematics inside the same bias module.
+        models["combined_500"] = load_model(
+            "physics_bias", args.physics_500, device, physics_strength=0.25,
+            physics_kinematics_mode="collision-smooth",
+        )[0]
+    if args.gated_long_history is not None:
+        for checkpoint in args.gated_long_history:
+            step = checkpoint.stem.rsplit("_", 1)[-1].lstrip("0") or "0"
+            models[f"long_history_gated_{step}"] = load_model(
+                "long_history_bias", checkpoint, device,
+                physics_kinematics_mode="temporal-only",
+            )[0]
     results = {}
     for model_name, model in models.items():
         results[model_name] = {}
