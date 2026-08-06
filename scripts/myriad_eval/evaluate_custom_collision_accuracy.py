@@ -180,6 +180,8 @@ def main():
     parser.add_argument("--original", type=Path, required=True)
     parser.add_argument("--physics-500", type=Path, required=True)
     parser.add_argument("--long-history-500", type=Path, required=True)
+    parser.add_argument("--gated-long-history", type=Path, default=None,
+                        help="Optional trained long-history checkpoint with cross-track gating")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dino-path", type=Path, required=True)
     parser.add_argument("--scenes-per-category", type=int, default=10)
@@ -208,6 +210,11 @@ def main():
         "physics_bias", args.physics_500, device, physics_strength=0.25,
         physics_kinematics_mode="collision-smooth",
     )[0]
+    if args.gated_long_history is not None:
+        models["long_history_gated_500"] = load_model(
+            "long_history_bias", args.gated_long_history, device,
+            physics_kinematics_mode="temporal-only",
+        )[0]
     results = {}
     for model_name, model in models.items():
         results[model_name] = {}
