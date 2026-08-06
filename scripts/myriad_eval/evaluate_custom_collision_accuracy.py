@@ -180,6 +180,8 @@ def main():
     parser.add_argument("--original", type=Path, required=True)
     parser.add_argument("--physics-500", type=Path, required=True)
     parser.add_argument("--long-history-500", type=Path, required=True)
+    parser.add_argument("--combined-physics", type=Path, default=None,
+                        help="Physics checkpoint used for the combined variant; defaults to --physics-500")
     parser.add_argument(
         "--gated-long-history", type=Path, action="append", default=None,
         help="Optional trained long-history checkpoint with cross-track gating; repeat for multiple steps",
@@ -187,6 +189,10 @@ def main():
     parser.add_argument(
         "--only-gated", action="store_true",
         help="Evaluate only the repeated --gated-long-history checkpoints",
+    )
+    parser.add_argument(
+        "--only-combined-gated", action="store_true",
+        help="Evaluate only the combined physics checkpoint and gated checkpoints",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dino-path", type=Path, required=True)
@@ -200,7 +206,8 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.init()
     models = {}
-    if not args.only_gated:
+    combined_checkpoint = args.combined_physics or args.physics_500
+    if not args.only_gated and not args.only_combined_gated:
         models["original"] = load_model("original", args.original, device)[0]
         models["physics_only_500_strength025"] = load_model(
             "physics_bias", args.physics_500, device, physics_strength=0.25,
@@ -214,7 +221,12 @@ def main():
         # combined variant: physical relation features plus causal long-history
         # kinematics inside the same bias module.
         models["combined_500"] = load_model(
-            "physics_bias", args.physics_500, device, physics_strength=0.25,
+            "physics_bias", combined_checkpoint, device, physics_strength=0.25,
+            physics_kinematics_mode="collision-smooth",
+        )[0]
+    elif args.only_combined_gated:
+        models["combined_500"] = load_model(
+            "physics_bias", combined_checkpoint, device, physics_strength=1.0,
             physics_kinematics_mode="collision-smooth",
         )[0]
     if args.gated_long_history is not None:
