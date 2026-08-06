@@ -183,7 +183,21 @@ def load_model(
             expanded = source.new_zeros(target.shape)
             expanded[..., :source.shape[-1]] = source
             state_dict[physics_input_key] = expanded
-    model.load_state_dict(state_dict, strict=True)
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    allowed_missing_prefixes = ()
+    if kind.startswith("long_history_bias"):
+        allowed_missing_prefixes = ("transformer.physics_bias_generator.",)
+    elif kind.startswith("combined_bias"):
+        allowed_missing_prefixes = ("transformer.long_history_bias_generator.",)
+    invalid_missing = [
+        key for key in incompatible.missing_keys
+        if not key.startswith(allowed_missing_prefixes)
+    ]
+    if invalid_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            f"Unsafe checkpoint for {kind}: missing={invalid_missing}, "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
     if (kind.startswith("physics_bias") or kind.startswith("combined_bias")) and physics_max_abs is not None:
         model.transformer.physics_bias_generator.max_abs_bias = physics_max_abs
     if (kind.startswith("physics_bias") or kind.startswith("combined_bias")) and physics_strength is not None:

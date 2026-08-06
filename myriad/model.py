@@ -860,6 +860,7 @@ class LongHistoryAttentionBiasMLP(nn.Module):
         history_window: int = 8,
         query_chunk_size: int = 64,
         checkpoint_chunks: bool = False,
+        cross_track_initial_scale: float = 0.1,
     ):
         super().__init__()
         if depth < 1 or n_bias_layers < 1 or query_chunk_size < 1:
@@ -868,6 +869,8 @@ class LongHistoryAttentionBiasMLP(nn.Module):
             raise ValueError("time_scale, max_abs_bias, and history_window must be positive")
         if initial_layer_scale < 0:
             raise ValueError("initial_layer_scale must be non-negative")
+        if not 0.0 < cross_track_initial_scale <= 1.0:
+            raise ValueError("cross_track_initial_scale must be in (0, 1]")
         self.n_heads = n_heads
         self.time_scale = float(time_scale)
         self.max_abs_bias = float(max_abs_bias)
@@ -875,6 +878,8 @@ class LongHistoryAttentionBiasMLP(nn.Module):
         self.history_window = int(history_window)
         self.query_chunk_size = query_chunk_size
         self.checkpoint_chunks = checkpoint_chunks
+        initial_logit = float(torch.logit(torch.tensor(cross_track_initial_scale)))
+        self.cross_track_logit = nn.Parameter(torch.full((n_heads,), initial_logit))
 
         layers: list[nn.Module] = [nn.Linear(6, hidden_dim), nn.SiLU()]
         for _ in range(depth - 1):
@@ -907,7 +912,15 @@ class LongHistoryAttentionBiasMLP(nn.Module):
         )
         raw_bias = self.mlp(features)
         bias = self.max_abs_bias * torch.tanh(raw_bias / self.max_abs_bias)
-        return bias.permute(0, 3, 1, 2).contiguous()
+        # Long-history evidence is strongest for the same track.  Keep a small,
+        # learnable cross-track residual so the model can still adapt to
+        # interactions without letting unrelated tracks dominate by default.
+        cross_track_gate = torch.sigmoid(self.cross_track_logit).to(delta.dtype)
+        bias = bias.permute(0, 3, 1, 2).contiguous()
+        relation_gate = same_track[:, None].to(delta.dtype) + (
+            1.0 - same_track[:, None].to(delta.dtype)
+        ) * cross_track_gate[None, :, None, None]
+        return bias * relation_gate
 
     def forward(self, pos_q, time_q, track_q, pos_k, time_k, track_k,
                 is_query_q=None, is_query_k=None):
@@ -1133,6 +1146,7 @@ class FusedTransformer(nn.Module):
         long_history_bias_initial_scale: float = 0.25,
         long_history_bias_window: int = 8,
         long_history_bias_query_chunk_size: int = 64,
+        long_history_bias_cross_track_initial_scale: float = 0.1,
         long_history_bias_checkpoint_chunks: bool = False,
         # use_full_skip: bool = True,
         # num_learnable_track_ids: int = -1,
@@ -1222,6 +1236,7 @@ class FusedTransformer(nn.Module):
                 initial_layer_scale=long_history_bias_initial_scale,
                 history_window=long_history_bias_window,
                 query_chunk_size=long_history_bias_query_chunk_size,
+                cross_track_initial_scale=long_history_bias_cross_track_initial_scale,
                 checkpoint_chunks=long_history_bias_checkpoint_chunks,
             )
             # Keep the historical state-dict path for the temporal-only model;
@@ -2474,6 +2489,7 @@ MyriadStepByStep_Large_Billiard_LongHistoryBias = partial(
         "long_history_bias_initial_scale": 0.25,
         "long_history_bias_window": 8,
         "long_history_bias_query_chunk_size": 64,
+        "long_history_bias_cross_track_initial_scale": 0.1,
         "long_history_bias_checkpoint_chunks": False,
     },
     image_feature_extractor_params={
