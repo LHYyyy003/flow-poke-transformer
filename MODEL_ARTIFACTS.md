@@ -24,3 +24,15 @@ from `0.02720 px` to `0.04181 px` relative to the 500-step checkpoint and its P9
 rose above the original model (`0.36216 px` versus `0.25087 px`). See the artifact
 root's `SHA256SUMS` and `ARTIFACTS.txt` for exact paths and checksums. It should not
 replace the no-bias baseline until collision-window and worst-scene metrics improve.
+
+The non-physical temporal-only attention ablation is stored under:
+
+```text
+/root/autodl-tmp/flow-poke-transformer-repro/training/long_history_attention_1500/2026-08-06/15-21-32/checkpoints
+```
+
+Its 500-, 1000-, and 1500-step checkpoints are research artifacts only. Although
+fixed one-step loss improved by up to 3.77%, five-scene macro rollout EPE regressed
+by 17.85%, 27.53%, and 44.65%, respectively. The 500-step checkpoint is the least
+harmful temporal-only candidate, but none should replace the no-bias baseline. See
+`LONG_HISTORY_ATTENTION_ABLATION_zh.md` for the complete protocol and results.
