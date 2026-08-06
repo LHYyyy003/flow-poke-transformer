@@ -38,7 +38,7 @@ def load_custom_data_module():
     return module
 
 
-def make_dataset(data_module):
+def make_dataset(data_module, base_seed: int = 51_000):
     simulation = data_module.SceneSimulationConfig(
         image_size=512, num_balls=6, radius=RADIUS, dt=0.01,
         trajectory_steps=50, moving_probability=0.80, min_speed=0.35,
@@ -48,7 +48,7 @@ def make_dataset(data_module):
     )
     episode = data_module.AdaptiveEpisodeConfig(fixed_context_trajectories=0)
     return data_module.AdaptiveSceneEpisodeDataset(
-        simulation=simulation, episode=episode, base_seed=51_000,
+        simulation=simulation, episode=episode, base_seed=base_seed,
     )
 
 
@@ -206,10 +206,11 @@ def main():
     parser.add_argument("--dino-path", type=Path, required=True)
     parser.add_argument("--scenes-per-category", type=int, default=10)
     parser.add_argument("--search-limit", type=int, default=250)
+    parser.add_argument("--base-seed", type=int, default=51_000)
     args = parser.parse_args()
     os.environ["MYRIAD_DINO_PATH"] = str(args.dino_path)
     data_module = load_custom_data_module()
-    dataset = make_dataset(data_module)
+    dataset = make_dataset(data_module, args.base_seed)
     scenes = collect_scenes(dataset, args.scenes_per_category, args.search_limit)
     device = torch.device("cuda:0")
     torch.cuda.init()
@@ -265,7 +266,8 @@ def main():
         torch.cuda.empty_cache()
     payload = {
         "protocol": {
-            "scene_source": "dataset-custom training walls",
+        "scene_source": "dataset-custom training walls",
+        "base_seed": args.base_seed,
             "scenes_per_category": args.scenes_per_category,
             "scene_indices": {k: [item[0] for item in v] for k, v in scenes.items()},
             "given_steps": GIVEN_STEPS,
