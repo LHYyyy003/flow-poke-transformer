@@ -119,6 +119,76 @@ def test_long_history_recovers_acceleration():
     torch.testing.assert_close(acceleration, torch.tensor([[[0.02, 0.0]]]), atol=1e-4, rtol=1e-4)
 
 
+def test_latest_velocity_uses_only_most_recent_observation():
+    velocity = PhysicsRelationBiasMLP._latest_velocity(
+        pos=torch.tensor([[[1.0, 0.0]]]),
+        time=torch.tensor([[3.0]]),
+        track=torch.tensor([[0]]),
+        history_pos=torch.tensor([[[0.0, 0.0], [0.8, 0.0], [50.0, 0.0]]]),
+        history_time=torch.tensor([[0.0, 2.0, 2.5]]),
+        history_track=torch.tensor([[0, 0, 0]]),
+        history_is_query=torch.tensor([[False, False, True]]),
+    )
+    torch.testing.assert_close(velocity, torch.tensor([[[0.2, 0.0]]]))
+
+
+def test_collision_gated_mode_uses_long_history_only_for_near_ball_pairs():
+    module = PhysicsRelationBiasMLP(1)
+    module.set_kinematics_mode("collision-gated", collision_distance=0.04)
+    captured = {}
+
+    def capture_features(_module, args):
+        captured["features"] = args[0].detach()
+
+    handle = module.mlp.register_forward_pre_hook(capture_features)
+    with torch.no_grad():
+        module.mlp[-1].weight.normal_(std=0.1)
+        module(
+            torch.tensor([[[0.20, 0.0], [0.80, 0.0]]]),
+            torch.tensor([[3.0, 3.0]]),
+            torch.tensor([[0, 0]]),
+            torch.tensor([[[0.00, 0.0], [0.10, 0.0], [0.15, 0.0], [0.27, 0.0], [0.95, 0.0]]]),
+            torch.tensor([[0.0, 1.0, 2.0, 3.0, 3.0]]),
+            torch.tensor([[0, 0, 0, 1, 2]]),
+            torch.zeros(1, 2, dtype=torch.bool),
+            torch.zeros(1, 5, dtype=torch.bool),
+        )
+    handle.remove()
+    features = captured["features"]
+    # The near different-ball pair receives long-history acceleration;
+    # the far pair is explicitly returned to short-history acceleration=0.
+    assert features[0, 0, 3, 11:14].abs().sum() > 0
+    torch.testing.assert_close(features[0, 1, 4, 11:14], torch.zeros(3))
+
+
+def test_invalid_kinematics_mode_is_rejected():
+    with pytest.raises(ValueError, match="kinematics mode"):
+        PhysicsRelationBiasMLP(1).set_kinematics_mode("always-magic")
+
+
+def test_smooth_collision_gate_is_continuous_and_track_safe():
+    module = PhysicsRelationBiasMLP(1)
+    module.set_kinematics_mode(
+        "collision-smooth", collision_distance=0.04, collision_temperature=0.008
+    )
+    distances = torch.tensor([[[[0.0], [0.04], [0.08]]]])
+    different_tracks = torch.zeros_like(distances, dtype=torch.bool)
+    gate = module._long_history_gate(distances, different_tracks)
+    assert gate[0, 0, 0, 0] > gate[0, 0, 1, 0] > gate[0, 0, 2, 0]
+    torch.testing.assert_close(gate[0, 0, 1, 0], torch.tensor(0.5))
+    same_tracks = torch.ones_like(distances, dtype=torch.bool)
+    torch.testing.assert_close(
+        module._long_history_gate(distances, same_tracks), torch.zeros_like(distances)
+    )
+
+
+def test_smooth_collision_gate_rejects_nonpositive_temperature():
+    with pytest.raises(ValueError, match="collision_temperature"):
+        PhysicsRelationBiasMLP(1).set_kinematics_mode(
+            "collision-smooth", collision_temperature=0.0
+        )
+
+
 def test_historical_relation_features_do_not_leak_future_positions():
     module = PhysicsRelationBiasMLP(2)
     with torch.no_grad():

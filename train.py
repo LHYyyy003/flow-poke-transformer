@@ -508,8 +508,24 @@ def _train(
         rank0logger.info(f"Trainable: {name}")
 
     optimizer = AdamW(trainable_parameters, lr=lr, weight_decay=weight_decay)
-    scheduler = make_scheduler(optimizer, lr=lr, warmup_steps=warmup_steps,
-                               max_steps=max_steps, scheduler_type=scheduler_type)
+    scheduler_max_steps = max_steps
+    if load_checkpoint is not None and not ckpt_load_scheduler and max_steps is not None:
+        scheduler_max_steps = max_steps - start_step
+        if scheduler_max_steps < 1:
+            raise ValueError(
+                f"max_steps ({max_steps}) must exceed resumed step ({start_step})"
+            )
+        rank0logger.info(
+            f"Reset scheduler over {scheduler_max_steps} remaining steps "
+            f"({start_step} -> {max_steps})."
+        )
+    scheduler = make_scheduler(
+        optimizer,
+        lr=lr,
+        warmup_steps=min(warmup_steps, scheduler_max_steps),
+        max_steps=scheduler_max_steps,
+        scheduler_type=scheduler_type,
+    )
     if load_checkpoint is not None:
         if ckpt_load_optim:
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -792,6 +808,10 @@ def train_billiards(batch_size, num_workers, nr_balls, frame_size, duration, dt,
 @click.option("--unfreeze-last-n-layers", default=6, show_default=True, type=int)
 @click.option("--physics-bias-checkpoint-chunks/--no-physics-bias-checkpoint-chunks",
               default=False, show_default=True)
+@click.option("--physics-kinematics-mode", default="long", show_default=True,
+              type=click.Choice(["long", "short", "collision-gated", "collision-smooth"]))
+@click.option("--collision-long-history-distance", default=0.04, show_default=True, type=float)
+@click.option("--collision-long-history-temperature", default=0.008, show_default=True, type=float)
 @click.option("--batch-size", default=1, show_default=True, type=int)
 @click.option("--num-workers", default=4, show_default=True, type=int)
 @click.option("--nr-balls", default=16, show_default=True, type=int)
@@ -803,6 +823,8 @@ def train_billiards(batch_size, num_workers, nr_balls, frame_size, duration, dt,
 @click.option("--collision-window-steps", default=10, show_default=True, type=int,
               help="Also weight this many flow steps after each collision.")
 def train_billiards_physics(train_mode, unfreeze_last_n_layers, physics_bias_checkpoint_chunks,
+                            physics_kinematics_mode, collision_long_history_distance,
+                            collision_long_history_temperature,
                             batch_size, num_workers, nr_balls, frame_size, duration, dt,
                             collision_loss_weight, collision_window_steps, **common_kwargs):
     """Train the separate MYRIAD billiards model with relation-MLP attention bias."""
@@ -834,11 +856,20 @@ def train_billiards_physics(train_mode, unfreeze_last_n_layers, physics_bias_che
         "physics_bias_history_decay": 4.0,
         "physics_bias_query_chunk_size": 64,
         "physics_bias_checkpoint_chunks": physics_bias_checkpoint_chunks,
+        "physics_kinematics_mode": physics_kinematics_mode,
+        "collision_long_history_distance": collision_long_history_distance,
+        "collision_long_history_temperature": collision_long_history_temperature,
     }
 
     def model_cls():
         model = MyriadStepByStep_Large_Billiard_PhysicsBias()
-        model.transformer.physics_bias_generator.checkpoint_chunks = physics_bias_checkpoint_chunks
+        generator = model.transformer.physics_bias_generator
+        generator.checkpoint_chunks = physics_bias_checkpoint_chunks
+        generator.set_kinematics_mode(
+            physics_kinematics_mode,
+            collision_distance=collision_long_history_distance,
+            collision_temperature=collision_long_history_temperature,
+        )
         return model
 
     config_dict = dict(

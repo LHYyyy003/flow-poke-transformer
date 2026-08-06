@@ -129,6 +129,9 @@ def load_model(
     device: torch.device,
     physics_max_abs: float | None = None,
     physics_strength: float | None = None,
+    physics_kinematics_mode: str = "long",
+    collision_long_history_distance: float = 0.04,
+    collision_long_history_temperature: float = 0.008,
 ):
     constructor = (
         MyriadStepByStep_Large_Billiard_PhysicsBias
@@ -161,6 +164,12 @@ def load_model(
     if kind.startswith("physics_bias") and physics_strength is not None:
         with torch.no_grad():
             model.transformer.physics_bias_generator.layer_head_scales.mul_(physics_strength)
+    if kind.startswith("physics_bias"):
+        model.transformer.physics_bias_generator.set_kinematics_mode(
+            physics_kinematics_mode,
+            collision_distance=collision_long_history_distance,
+            collision_temperature=collision_long_history_temperature,
+        )
     if kind == "physics_bias_disabled":
         model.transformer.use_physics_bias = False
     step = int(checkpoint.get("step", -1))
@@ -183,6 +192,9 @@ def evaluate_one(
     physics_max_abs: float | None = None,
     physics_strength: float | None = None,
     oracle_history: bool = False,
+    physics_kinematics_mode: str = "long",
+    collision_long_history_distance: float = 0.04,
+    collision_long_history_temperature: float = 0.008,
 ) -> tuple[dict, np.ndarray]:
     torch.cuda.empty_cache()
     model, checkpoint_step, load_seconds = load_model(
@@ -191,6 +203,9 @@ def evaluate_one(
         device,
         physics_max_abs=physics_max_abs,
         physics_strength=physics_strength,
+        physics_kinematics_mode=physics_kinematics_mode,
+        collision_long_history_distance=collision_long_history_distance,
+        collision_long_history_temperature=collision_long_history_temperature,
     )
     params = sum(parameter.numel() for parameter in model.parameters())
     image = image_cpu.to(device)
@@ -310,6 +325,24 @@ def main() -> None:
         action="store_true",
         help="Also measure predictions while feeding ground-truth history.",
     )
+    parser.add_argument(
+        "--physics-kinematics-mode",
+        choices=("long", "short", "collision-gated", "collision-smooth"),
+        default="long",
+        help="Choose when the physics relation encoder uses long-history kinematics.",
+    )
+    parser.add_argument(
+        "--collision-long-history-distance",
+        type=float,
+        default=0.04,
+        help="Normalized absolute surface-distance window for collision-gated mode.",
+    )
+    parser.add_argument(
+        "--collision-long-history-temperature",
+        type=float,
+        default=0.008,
+        help="Sigmoid transition width for collision-smooth mode.",
+    )
     args = parser.parse_args()
 
     if not (args.dino_path / "config.json").is_file():
@@ -339,12 +372,18 @@ def main() -> None:
         args.embed_repeats, args.rollout_warmup, args.rollout_repeats,
         physics_max_abs=args.physics_max_abs,
         physics_strength=args.physics_strength,
+        physics_kinematics_mode=args.physics_kinematics_mode,
+        collision_long_history_distance=args.collision_long_history_distance,
+        collision_long_history_temperature=args.collision_long_history_temperature,
         oracle_history=args.oracle_history,
     )
     torch.cuda.reset_peak_memory_stats(device.index)
     physics_disabled, physics_disabled_prediction = evaluate_one(
         "physics_bias_disabled", args.physics, image, truth, ts, device,
         args.embed_repeats, args.rollout_warmup, args.rollout_repeats,
+        physics_kinematics_mode=args.physics_kinematics_mode,
+        collision_long_history_distance=args.collision_long_history_distance,
+        collision_long_history_temperature=args.collision_long_history_temperature,
         oracle_history=args.oracle_history,
     )
 

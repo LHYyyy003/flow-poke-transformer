@@ -574,6 +574,11 @@ class PhysicsRelationBiasMLP(nn.Module):
         self.history_decay = float(history_decay)
         self.query_chunk_size = query_chunk_size
         self.checkpoint_chunks = checkpoint_chunks
+        # Runtime-only ablation control. It deliberately does not enter the
+        # state dict, so existing 11- and 14-feature checkpoints remain loadable.
+        self.kinematics_mode = "long"
+        self.collision_long_history_distance = 0.04
+        self.collision_long_history_temperature = 0.008
 
         # Keep the original 11 relation inputs first, then append causal
         # long-history acceleration (2) and radial closing acceleration.
@@ -664,6 +669,70 @@ class PhysicsRelationBiasMLP(nn.Module):
         )
         return velocity
 
+    @staticmethod
+    def _latest_velocity(
+        pos: torch.Tensor,
+        time: torch.Tensor,
+        track: torch.Tensor,
+        history_pos: torch.Tensor,
+        history_time: torch.Tensor,
+        history_track: torch.Tensor,
+        history_is_query: torch.Tensor,
+    ) -> torch.Tensor:
+        """Finite-difference velocity from only the latest causal observation."""
+        same_track = track[:, :, None] == history_track[:, None, :]
+        earlier = history_time[:, None, :] < time[:, :, None]
+        observed = ~history_is_query[:, None, :]
+        valid = same_track & earlier & observed
+        candidate_time = history_time[:, None, :].expand(-1, pos.size(1), -1)
+        candidate_time = candidate_time.masked_fill(~valid, float("-inf"))
+        previous_time, previous_idx = candidate_time.max(dim=-1)
+        has_history = valid.any(dim=-1)
+        expanded_history = history_pos[:, None].expand(-1, pos.size(1), -1, -1)
+        previous_pos = torch.gather(
+            expanded_history, 2, previous_idx[..., None, None].expand(-1, -1, 1, 2)
+        ).squeeze(2)
+        dt = (time - previous_time).clamp_min(1e-6)
+        velocity = (pos - previous_pos) / dt[..., None]
+        velocity = torch.where(has_history[..., None], velocity, torch.zeros_like(velocity))
+        return velocity.clamp(-1.0, 1.0)
+
+    def set_kinematics_mode(
+        self,
+        mode: str,
+        collision_distance: float | None = None,
+        collision_temperature: float | None = None,
+    ) -> None:
+        """Select long, short, or collision-local long-history features."""
+        if mode not in {"long", "short", "collision-gated", "collision-smooth"}:
+            raise ValueError(f"Unknown physics kinematics mode: {mode}")
+        if collision_distance is not None:
+            if collision_distance <= 0:
+                raise ValueError("collision_distance must be positive")
+            self.collision_long_history_distance = float(collision_distance)
+        if collision_temperature is not None:
+            if collision_temperature <= 0:
+                raise ValueError("collision_temperature must be positive")
+            self.collision_long_history_temperature = float(collision_temperature)
+        self.kinematics_mode = mode
+
+    def _long_history_gate(
+        self,
+        surface_distance: torch.Tensor,
+        same_track: torch.Tensor,
+    ) -> torch.Tensor:
+        different_track = (~same_track.bool()).to(surface_distance.dtype)
+        if self.kinematics_mode == "collision-gated":
+            return different_track * (
+                surface_distance.abs() <= self.collision_long_history_distance
+            ).to(surface_distance.dtype)
+        if self.kinematics_mode == "collision-smooth":
+            return different_track * torch.sigmoid(
+                (self.collision_long_history_distance - surface_distance.abs())
+                / self.collision_long_history_temperature
+            )
+        return torch.ones_like(surface_distance)
+
     def _chunk(
         self,
         pos_q: torch.Tensor,
@@ -676,6 +745,8 @@ class PhysicsRelationBiasMLP(nn.Module):
         acceleration_q: torch.Tensor,
         velocity_k: torch.Tensor,
         acceleration_k: torch.Tensor,
+        latest_velocity_q: torch.Tensor,
+        latest_velocity_k: torch.Tensor,
         is_query_q: torch.Tensor,
         is_query_k: torch.Tensor,
     ) -> torch.Tensor:
@@ -684,11 +755,24 @@ class PhysicsRelationBiasMLP(nn.Module):
         delta_time = (time_q[:, :, None] - time_k[:, None, :]).unsqueeze(-1)
         delta_time = torch.clamp(delta_time / self.time_scale, min=-1.0, max=1.0)
         same_track = (track_q[:, :, None] == track_k[:, None, :]).unsqueeze(-1).to(rel_pos.dtype)
-        rel_velocity = velocity_k[:, None, :, :] - velocity_q[:, :, None, :]
+        long_rel_velocity = velocity_k[:, None, :, :] - velocity_q[:, :, None, :]
         rel_acceleration = acceleration_k[:, None, :, :] - acceleration_q[:, :, None, :]
+        short_rel_velocity = latest_velocity_k[:, None, :, :] - latest_velocity_q[:, :, None, :]
+        surface_distance = distance - 2.0 * self.ball_radius
+        if self.kinematics_mode == "short":
+            rel_velocity = short_rel_velocity
+            rel_acceleration = torch.zeros_like(rel_acceleration)
+        elif self.kinematics_mode in {"collision-gated", "collision-smooth"}:
+            # Geometry provides a causal proxy for a short collision window.
+            # Long-history features are used only for different balls whose
+            # surfaces are close; all other relations use the latest step.
+            gate = self._long_history_gate(surface_distance, same_track)
+            rel_velocity = short_rel_velocity + gate * (long_rel_velocity - short_rel_velocity)
+            rel_acceleration = gate * rel_acceleration
+        else:
+            rel_velocity = long_rel_velocity
         radial_velocity = (rel_pos * rel_velocity).sum(dim=-1, keepdim=True)
         closing_speed = -radial_velocity / distance.clamp_min(1e-6)
-        surface_distance = distance - 2.0 * self.ball_radius
         relative_speed_sq = rel_velocity.square().sum(dim=-1, keepdim=True)
         t_closest = -radial_velocity / relative_speed_sq.clamp_min(1e-8)
         t_closest = torch.clamp(t_closest / self.time_scale, min=-1.0, max=1.0)
@@ -722,12 +806,19 @@ class PhysicsRelationBiasMLP(nn.Module):
             pos_k, time_k, track_k, pos_k, time_k, track_k, is_query_k,
             self.history_window, self.history_decay,
         )
+        latest_velocity_q = self._latest_velocity(
+            pos_q, time_q, track_q, pos_k, time_k, track_k, is_query_k,
+        )
+        latest_velocity_k = self._latest_velocity(
+            pos_k, time_k, track_k, pos_k, time_k, track_k, is_query_k,
+        )
         chunks = []
         for start in range(0, pos_q.size(1), self.query_chunk_size):
             args = (pos_q[:, start : start + self.query_chunk_size], time_q[:, start : start + self.query_chunk_size],
                     track_q[:, start : start + self.query_chunk_size], pos_k, time_k, track_k,
                     velocity_q[:, start : start + self.query_chunk_size],
                     acceleration_q[:, start : start + self.query_chunk_size], velocity_k, acceleration_k,
+                    latest_velocity_q[:, start : start + self.query_chunk_size], latest_velocity_k,
                     is_query_q[:, start : start + self.query_chunk_size], is_query_k)
             if self.checkpoint_chunks and self.training:
                 chunk_bias = checkpoint(self._chunk, *args, use_reentrant=False)

@@ -133,6 +133,10 @@ the latest eight same-track states. This supplies smoothed velocity, acceleratio
 closing acceleration to the relation MLP. Recent states receive higher weight, preserving responsiveness around
 collisions while reducing autoregressive velocity noise. The fit uses only earlier non-query tokens.
 
+For collision-local inference, `collision-smooth` blends the eight-state estimate with the latest-step estimate using
+a causal sigmoid of absolute ball-surface distance. The tested adaptation uses distance `0.04`, temperature `0.008`,
+and runtime physics strength `0.25`; the same gate must be enabled during training and evaluation.
+
 The per-head relation output is zero-initialized and bounded to ±1 with tanh; image-token pairs receive zero bias,
 and the existing causal BlockMask remains authoritative. Independent layer/head scales start at 0.5, which reduced
 fixed-scene EPE relative to 1.0 in the diagnostic sweep while remaining learnable. The normalized billiards radius
