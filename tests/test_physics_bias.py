@@ -5,7 +5,10 @@ import torch
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 
-from myriad.model import PhysicsRelationBiasMLP, FusedTransformer, FusedTransformerLayer
+from myriad.model import (
+    PhysicsRelationBiasMLP, LongHistoryAttentionBiasMLP,
+    FusedTransformer, FusedTransformerLayer,
+)
 from train import configure_physics_training, load_init_checkpoint
 
 
@@ -33,6 +36,38 @@ def test_zero_initialization():
         module.layer_head_scales,
         torch.full_like(module.layer_head_scales, 0.5),
     )
+
+
+def test_long_history_bias_is_position_invariant():
+    module = LongHistoryAttentionBiasMLP(4, query_chunk_size=2)
+    with torch.no_grad():
+        module.mlp[-1].weight.normal_(std=0.01)
+        module.mlp[-1].bias.normal_(std=0.01)
+    args = list(metadata())
+    original = module(*args)
+    args[0] = torch.randn_like(args[0]) * 1e6
+    args[3] = torch.randn_like(args[3]) * 1e6
+    changed = module(*args)
+    torch.testing.assert_close(original, changed, atol=0, rtol=0)
+
+
+def test_long_history_bias_shape_zero_init_and_gradients():
+    module = LongHistoryAttentionBiasMLP(4, query_chunk_size=2, checkpoint_chunks=True)
+    args = metadata()
+    bias = module(*args)
+    assert bias.shape == (2, 4, 5, 7)
+    torch.testing.assert_close(bias, torch.zeros_like(bias), atol=0, rtol=0)
+    bias.sum().backward()
+    assert module.mlp[-1].weight.grad is not None
+
+
+def test_long_history_and_physics_bias_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        FusedTransformer(
+            width=16, depth=2, aux_feat_dim=8, d_head=8, out_mlp_depth=1,
+            ff_expand=2, track_id_embedding=False,
+            use_physics_bias=True, use_long_history_bias=True,
+        )
 
 
 def test_negative_initial_layer_scale_is_rejected():

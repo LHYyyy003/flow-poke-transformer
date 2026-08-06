@@ -839,6 +839,108 @@ class PhysicsRelationBiasMLP(nn.Module):
         scaled_bias = bias * scale
         return self.max_abs_bias * torch.tanh(scaled_bias / self.max_abs_bias)
 
+
+class LongHistoryAttentionBiasMLP(nn.Module):
+    """Attention bias using temporal/identity metadata, never physical state.
+
+    Positions are accepted only to keep the relation-bias call interface shared
+    with ``PhysicsRelationBiasMLP``.  The bias is a function of time, track
+    identity, observation availability, and the amount of causal history.
+    """
+
+    def __init__(
+        self,
+        n_heads: int,
+        hidden_dim: int = 64,
+        depth: int = 2,
+        time_scale: float = 50.0,
+        max_abs_bias: float = 0.25,
+        n_bias_layers: int = 4,
+        initial_layer_scale: float = 0.25,
+        history_window: int = 8,
+        query_chunk_size: int = 64,
+        checkpoint_chunks: bool = False,
+    ):
+        super().__init__()
+        if depth < 1 or n_bias_layers < 1 or query_chunk_size < 1:
+            raise ValueError("depth, n_bias_layers, and query_chunk_size must be positive")
+        if time_scale <= 0 or max_abs_bias <= 0 or history_window < 1:
+            raise ValueError("time_scale, max_abs_bias, and history_window must be positive")
+        if initial_layer_scale < 0:
+            raise ValueError("initial_layer_scale must be non-negative")
+        self.n_heads = n_heads
+        self.time_scale = float(time_scale)
+        self.max_abs_bias = float(max_abs_bias)
+        self.n_bias_layers = n_bias_layers
+        self.history_window = int(history_window)
+        self.query_chunk_size = query_chunk_size
+        self.checkpoint_chunks = checkpoint_chunks
+
+        layers: list[nn.Module] = [nn.Linear(6, hidden_dim), nn.SiLU()]
+        for _ in range(depth - 1):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SiLU()])
+        layers.append(zero_init(nn.Linear(hidden_dim, n_heads)))
+        self.mlp = nn.Sequential(*layers)
+        self.layer_head_scales = nn.Parameter(
+            torch.full((n_bias_layers, n_heads), float(initial_layer_scale))
+        )
+
+    def _chunk(self, time_q, track_q, time_k, track_k, is_query_k):
+        delta = time_q[:, :, None] - time_k[:, None, :]
+        delta_scaled = (delta / self.time_scale).clamp(-1.0, 1.0)
+        same_track = track_q[:, :, None] == track_k[:, None, :]
+        observed = ~is_query_k[:, None, :]
+        causal_history = same_track & observed & (delta > 0)
+        history_count = causal_history.sum(dim=-1, keepdim=True).clamp(max=self.history_window)
+        history_fraction = history_count.to(delta.dtype) / self.history_window
+        history_fraction = history_fraction.expand_as(delta)
+        features = torch.stack(
+            (
+                delta_scaled,
+                delta_scaled.abs(),
+                same_track.to(delta.dtype),
+                observed.expand_as(delta).to(delta.dtype),
+                causal_history.to(delta.dtype),
+                history_fraction,
+            ),
+            dim=-1,
+        )
+        raw_bias = self.mlp(features)
+        bias = self.max_abs_bias * torch.tanh(raw_bias / self.max_abs_bias)
+        return bias.permute(0, 3, 1, 2).contiguous()
+
+    def forward(self, pos_q, time_q, track_q, pos_k, time_k, track_k,
+                is_query_q=None, is_query_k=None):
+        if pos_q.ndim != 3 or pos_k.ndim != 3:
+            raise ValueError("pos_q and pos_k must have shape [B, L, C]")
+        if is_query_k is None:
+            is_query_k = torch.zeros_like(track_k, dtype=torch.bool)
+        chunks = []
+        for start in range(0, time_q.size(1), self.query_chunk_size):
+            args = (
+                time_q[:, start:start + self.query_chunk_size],
+                track_q[:, start:start + self.query_chunk_size],
+                time_k, track_k, is_query_k,
+            )
+            if self.checkpoint_chunks and self.training:
+                chunk_bias = checkpoint(self._chunk, *args, use_reentrant=False)
+            else:
+                chunk_bias = self._chunk(*args)
+            chunks.append(chunk_bias)
+        if not chunks:
+            return pos_q.new_zeros((pos_q.size(0), self.n_heads, 0, pos_k.size(1)))
+        bias = torch.cat(chunks, dim=2)
+        if not torch.isfinite(bias).all():
+            raise FloatingPointError("LongHistoryAttentionBiasMLP produced NaN or Inf")
+        return bias
+
+    def for_layer(self, bias: torch.Tensor, active_layer_index: int) -> torch.Tensor:
+        if not 0 <= active_layer_index < self.n_bias_layers:
+            raise IndexError(f"active_layer_index out of range: {active_layer_index}")
+        scale = self.layer_head_scales[active_layer_index][None, :, None, None].to(bias.dtype)
+        scaled_bias = bias * scale
+        return self.max_abs_bias * torch.tanh(scaled_bias / self.max_abs_bias)
+
 class FusedTransformerLayer(nn.Module):
 
     def __init__(
@@ -1022,6 +1124,16 @@ class FusedTransformer(nn.Module):
         physics_bias_history_decay: float = 4.0,
         physics_bias_query_chunk_size: int = 64,
         physics_bias_checkpoint_chunks: bool = False,
+        use_long_history_bias: bool = False,
+        long_history_bias_hidden_dim: int = 64,
+        long_history_bias_depth: int = 2,
+        long_history_bias_time_scale: float = 50.0,
+        long_history_bias_max_abs: float = 0.25,
+        long_history_bias_num_layers: int | None = None,
+        long_history_bias_initial_scale: float = 0.25,
+        long_history_bias_window: int = 8,
+        long_history_bias_query_chunk_size: int = 64,
+        long_history_bias_checkpoint_chunks: bool = False,
         # use_full_skip: bool = True,
         # num_learnable_track_ids: int = -1,
     ):
@@ -1030,10 +1142,22 @@ class FusedTransformer(nn.Module):
         self.ada_norm_size = ada_norm_size
         self.time_norm_size = time_norm_size
         self.use_physics_bias = use_physics_bias
+        self.use_long_history_bias = use_long_history_bias
+        if use_physics_bias and use_long_history_bias:
+            raise ValueError("physics and long-history attention biases are mutually exclusive")
         physics_bias_num_layers = min(4, depth) if physics_bias_num_layers is None else physics_bias_num_layers
+        long_history_bias_num_layers = (
+            min(4, depth) if long_history_bias_num_layers is None else long_history_bias_num_layers
+        )
         if use_physics_bias and not 1 <= physics_bias_num_layers <= depth:
             raise ValueError(f"physics_bias_num_layers must be in [1, {depth}], got {physics_bias_num_layers}")
-        self.physics_bias_num_layers = physics_bias_num_layers
+        if use_long_history_bias and not 1 <= long_history_bias_num_layers <= depth:
+            raise ValueError(
+                f"long_history_bias_num_layers must be in [1, {depth}], got {long_history_bias_num_layers}"
+            )
+        self.physics_bias_num_layers = (
+            long_history_bias_num_layers if use_long_history_bias else physics_bias_num_layers
+        )
         # self.use_full_skip = use_full_skip
 
         self.embedder = FlowPokeEmbedder(
@@ -1074,8 +1198,8 @@ class FusedTransformer(nn.Module):
             mid_level.append(layer)
         self.mid_level = Level(mid_level)
 
-        self.physics_bias_generator = (
-            PhysicsRelationBiasMLP(
+        if use_physics_bias:
+            self.physics_bias_generator = PhysicsRelationBiasMLP(
                 n_heads=width // d_head,
                 hidden_dim=physics_bias_hidden_dim,
                 depth=physics_bias_depth,
@@ -1088,8 +1212,22 @@ class FusedTransformer(nn.Module):
                 history_decay=physics_bias_history_decay,
                 query_chunk_size=physics_bias_query_chunk_size,
                 checkpoint_chunks=physics_bias_checkpoint_chunks,
-            ) if use_physics_bias else None
-        )
+            )
+        elif use_long_history_bias:
+            self.physics_bias_generator = LongHistoryAttentionBiasMLP(
+                n_heads=width // d_head,
+                hidden_dim=long_history_bias_hidden_dim,
+                depth=long_history_bias_depth,
+                time_scale=long_history_bias_time_scale,
+                max_abs_bias=long_history_bias_max_abs,
+                n_bias_layers=long_history_bias_num_layers,
+                initial_layer_scale=long_history_bias_initial_scale,
+                history_window=long_history_bias_window,
+                query_chunk_size=long_history_bias_query_chunk_size,
+                checkpoint_chunks=long_history_bias_checkpoint_chunks,
+            )
+        else:
+            self.physics_bias_generator = None
         self.register_buffer("physics_pos_cache", torch.empty((1, 0, 2)), persistent=False)
         self.register_buffer("physics_time_cache", torch.empty((1, 0)), persistent=False)
         self.register_buffer("physics_track_cache", torch.empty((1, 0), dtype=torch.long), persistent=False)
@@ -1196,9 +1334,9 @@ class FusedTransformer(nn.Module):
 
         physics_bias = None
         q_motion_offset = k_motion_offset = 0
-        if self.use_physics_bias:
+        if self.use_physics_bias or self.use_long_history_bias:
             if self.physics_bias_generator is None:
-                raise AssertionError("use_physics_bias=True without a generator")
+                raise AssertionError("relation attention bias enabled without a generator")
             B_motion, L_motion, _ = motion_pos_current.shape
             if i_kv is None:
                 pos_k, time_k, track_k = motion_pos_current, motion_time_current, motion_track_current
@@ -2272,6 +2410,54 @@ MyriadStepByStep_Large_Billiard_PhysicsBias = partial(
         "physics_bias_history_decay": 4.0,
         "physics_bias_query_chunk_size": 64,
         "physics_bias_checkpoint_chunks": False,
+    },
+    image_feature_extractor_params={
+        "model_version": "dinov3_vitl16",
+        "image_size": 512,
+    },
+    distribution_head_params={
+        "depth": 3,
+        "d_cond": 1024,
+        "expansion_factor": 1,
+        "internal_value_scale": 500,
+        "value_scale_cascade": True,
+        "value_scale_cascade_steps": 512,
+        "cat_embs": False,
+        "relu": False,
+        "cond_dropout": 0.0,
+        "steps": 50,
+        "cfg_scale": 1.0,
+    },
+)
+
+MyriadStepByStep_Large_Billiard_LongHistoryBias = partial(
+    MyriadStepByStep,
+    width=1024,
+    depth=24,
+    train_image_feature_extractor=True,
+    distribution_type="fm",
+    transformer_params={
+        "d_head": 128,
+        "out_mlp_depth": 2,
+        "ff_expand": 4,
+        "ada_norm_size": 1024,
+        "time_norm_size": -1,
+        "input_scale": 10,
+        "emb_depth": 3,
+        "track_id_embedding": True,
+        "max_num_track_ids": 256,
+        "scaled_cosine_sim": True,
+        "use_physics_bias": False,
+        "use_long_history_bias": True,
+        "long_history_bias_hidden_dim": 64,
+        "long_history_bias_depth": 2,
+        "long_history_bias_time_scale": 50.0,
+        "long_history_bias_max_abs": 0.25,
+        "long_history_bias_num_layers": 4,
+        "long_history_bias_initial_scale": 0.25,
+        "long_history_bias_window": 8,
+        "long_history_bias_query_chunk_size": 64,
+        "long_history_bias_checkpoint_chunks": False,
     },
     image_feature_extractor_params={
         "model_version": "dinov3_vitl16",

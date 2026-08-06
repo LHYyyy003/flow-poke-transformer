@@ -30,11 +30,11 @@ def set_requires_grad(module, value: bool):
 
 
 def configure_physics_training(model, train_mode: str, unfreeze_last_n_layers: int = 6):
-    """Freeze a physics-bias model for a stable, process-level training stage."""
+    """Freeze a relation-bias model for a stable, process-level training stage."""
     set_requires_grad(model, False)
     generator = model.transformer.physics_bias_generator
     if generator is None:
-        raise ValueError("Physics training requires a model with use_physics_bias=True")
+        raise ValueError("Relation-bias training requires a model with an attention-bias generator")
     set_requires_grad(generator, True)
     if train_mode == "physics-only":
         pass
@@ -879,6 +879,74 @@ def train_billiards_physics(train_mode, unfreeze_last_n_layers, physics_bias_che
         unfreeze_last_n_layers=unfreeze_last_n_layers, **physics_config, **common_kwargs,
         collision_loss_weight=collision_loss_weight,
         collision_window_steps=collision_window_steps,
+    )
+    _train(
+        data=data,
+        model_cls=model_cls,
+        make_train_fns=myriad_make_train_fns,
+        config_dict=config_dict,
+        configure_model=configure_physics_training,
+        train_mode=train_mode,
+        unfreeze_last_n_layers=unfreeze_last_n_layers,
+        **common_kwargs,
+    )
+
+
+@cli.command("billiards-long-history")
+@common_options
+@click.option("--train-mode", default="physics-only", show_default=True,
+              type=click.Choice(["physics-only", "finetune"]))
+@click.option("--unfreeze-last-n-layers", default=6, show_default=True, type=int)
+@click.option("--long-history-checkpoint-chunks/--no-long-history-checkpoint-chunks",
+              default=False, show_default=True)
+@click.option("--batch-size", default=1, show_default=True, type=int)
+@click.option("--num-workers", default=4, show_default=True, type=int)
+@click.option("--nr-balls", default=16, show_default=True, type=int)
+@click.option("--frame-size", default=512, show_default=True, type=int)
+@click.option("--duration", default=0.5, show_default=True, type=float)
+@click.option("--dt", default=0.01, show_default=True, type=float)
+@click.option("--collision-loss-weight", default=3.0, show_default=True, type=float)
+@click.option("--collision-window-steps", default=10, show_default=True, type=int)
+def train_billiards_long_history(train_mode, unfreeze_last_n_layers,
+                                 long_history_checkpoint_chunks, batch_size, num_workers,
+                                 nr_balls, frame_size, duration, dt,
+                                 collision_loss_weight, collision_window_steps, **common_kwargs):
+    """Train a temporal-history attention bias with no physical-state inputs."""
+    from myriad.model import MyriadStepByStep_Large_Billiard_LongHistoryBias
+    from myriad.data_billiards import BilliardSimDataModule
+
+    data = BilliardSimDataModule(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        train={"dataset_config": dict(
+            nr_balls=nr_balls,
+            frame_size=frame_size,
+            duration=duration,
+            dt=dt,
+            collision_loss_weight=collision_loss_weight,
+            collision_window_steps=collision_window_steps,
+        )},
+    )
+
+    def model_cls():
+        model = MyriadStepByStep_Large_Billiard_LongHistoryBias()
+        model.transformer.physics_bias_generator.checkpoint_chunks = long_history_checkpoint_chunks
+        return model
+
+    config_dict = dict(
+        model="billiard-long-history", dataset="billiards", batch_size=batch_size,
+        num_workers=num_workers, nr_balls=nr_balls, frame_size=frame_size,
+        duration=duration, dt=dt, train_mode=train_mode,
+        unfreeze_last_n_layers=unfreeze_last_n_layers,
+        use_physics_bias=False, use_long_history_bias=True,
+        long_history_bias_hidden_dim=64, long_history_bias_depth=2,
+        long_history_bias_time_scale=50.0, long_history_bias_max_abs=0.25,
+        long_history_bias_num_layers=4, long_history_bias_initial_scale=0.25,
+        long_history_bias_window=8,
+        long_history_checkpoint_chunks=long_history_checkpoint_chunks,
+        collision_loss_weight=collision_loss_weight,
+        collision_window_steps=collision_window_steps,
+        **common_kwargs,
     )
     _train(
         data=data,
