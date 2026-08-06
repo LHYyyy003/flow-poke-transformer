@@ -1151,6 +1151,7 @@ class FusedTransformer(nn.Module):
         use_combined_bias_gates: bool = False,
         combined_physics_initial_scale: float = 0.5,
         combined_long_history_initial_scale: float = 0.25,
+        combined_gate_hidden_dim: int = 32,
         # use_full_skip: bool = True,
         # num_learnable_track_ids: int = -1,
     ):
@@ -1263,6 +1264,11 @@ class FusedTransformer(nn.Module):
             self.long_history_source_logit = nn.Parameter(torch.full(
                 (n_heads,), float(torch.logit(torch.tensor(combined_long_history_initial_scale)))
             ))
+            self.combined_gate_mlp = nn.Sequential(
+                nn.Linear(6, combined_gate_hidden_dim),
+                nn.SiLU(),
+                zero_init(nn.Linear(combined_gate_hidden_dim, 2 * n_heads)),
+            )
         self.register_buffer("physics_pos_cache", torch.empty((1, 0, 2)), persistent=False)
         self.register_buffer("physics_time_cache", torch.empty((1, 0)), persistent=False)
         self.register_buffer("physics_track_cache", torch.empty((1, 0), dtype=torch.long), persistent=False)
@@ -1369,6 +1375,7 @@ class FusedTransformer(nn.Module):
 
         physics_bias = None
         long_history_bias = None
+        combined_context_gates = None
         q_motion_offset = k_motion_offset = 0
         if self.use_physics_bias or self.use_long_history_bias:
             if self.use_physics_bias and self.physics_bias_generator is None:
@@ -1418,6 +1425,30 @@ class FusedTransformer(nn.Module):
                     motion_pos_current, motion_time_current, motion_track_current, pos_k, time_k, track_k,
                     motion_query_current, query_k,
                 )
+            if self.use_combined_bias_gates:
+                delta = motion_time_current[:, :, None] - time_k[:, None, :]
+                delta_scaled = (delta / 50.0).clamp(-1.0, 1.0)
+                same_track = motion_track_current[:, :, None] == track_k[:, None, :]
+                observed = (~query_k)[:, None, :].expand_as(delta)
+                distance = torch.linalg.vector_norm(
+                    motion_pos_current[:, :, None, :] - pos_k[:, None, :, :], dim=-1
+                ).clamp(max=1.0)
+                wall_distance = torch.minimum(
+                    torch.minimum(motion_pos_current[..., 0], 1.0 - motion_pos_current[..., 0]),
+                    torch.minimum(motion_pos_current[..., 1], 1.0 - motion_pos_current[..., 1]),
+                )[:, :, None].expand_as(delta).clamp(max=1.0)
+                gate_features = torch.stack(
+                    (delta_scaled, delta_scaled.abs(), same_track.to(delta.dtype),
+                     observed.to(delta.dtype), distance, wall_distance), dim=-1
+                )
+                gate_delta = self.combined_gate_mlp(gate_features)
+                gate_delta = gate_delta.permute(0, 3, 1, 2).contiguous()
+                base_physics = self.physics_source_logit[None, :, None, None]
+                base_temporal = self.long_history_source_logit[None, :, None, None]
+                combined_context_gates = (
+                    torch.sigmoid(base_physics + gate_delta[:, :self.pos_emb.n_heads]),
+                    torch.sigmoid(base_temporal + gate_delta[:, self.pos_emb.n_heads:]),
+                )
 
         # standard transformer forward
         B, *DIMS, C = x.shape
@@ -1431,13 +1462,21 @@ class FusedTransformer(nn.Module):
                 if physics_bias is not None:
                     physics_part = self.physics_bias_generator.for_layer(physics_bias, active_index)
                     if self.use_combined_bias_gates:
-                        physics_part = physics_part * torch.sigmoid(self.physics_source_logit)[None, :, None, None]
+                        if combined_context_gates is None:
+                            physics_gate = torch.sigmoid(self.physics_source_logit)[None, :, None, None]
+                        else:
+                            physics_gate = combined_context_gates[0]
+                        physics_part = physics_part * physics_gate
                     bias_parts.append(physics_part)
                 if long_history_bias is not None:
                     long_generator = self.long_history_bias_generator or self.physics_bias_generator
                     long_part = long_generator.for_layer(long_history_bias, active_index)
                     if self.use_combined_bias_gates:
-                        long_part = long_part * torch.sigmoid(self.long_history_source_logit)[None, :, None, None]
+                        if combined_context_gates is None:
+                            temporal_gate = torch.sigmoid(self.long_history_source_logit)[None, :, None, None]
+                        else:
+                            temporal_gate = combined_context_gates[1]
+                        long_part = long_part * temporal_gate
                     bias_parts.append(long_part)
                 layer_bias = torch.stack(bias_parts, dim=0).sum(dim=0)
             x = layer(x, theta, scale=scale, block_mask=block_mask, i_kv=i_kv,
@@ -2576,6 +2615,7 @@ MyriadStepByStep_Large_Billiard_CombinedBias = partial(
         "use_combined_bias_gates": True,
         "combined_physics_initial_scale": 0.5,
         "combined_long_history_initial_scale": 0.25,
+        "combined_gate_hidden_dim": 32,
     },
     image_feature_extractor_params={
         "model_version": "dinov3_vitl16",

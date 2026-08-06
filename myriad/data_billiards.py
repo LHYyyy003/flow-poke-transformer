@@ -119,8 +119,16 @@ def setup_billiard_game(
     nr_balls: int,
     ball_radius: int,
     p_moving: float = 0.25,
+    fixed_border_offsets: tuple[int, int, int, int] | None = None,
 ) -> tuple[billiards.Billiard, list[int]]:
-    border_offsets = [random.randrange(min_border_offset, max_border_offset) for _ in range(4)]
+    if fixed_border_offsets is None:
+        border_offsets = [random.randrange(min_border_offset, max_border_offset) for _ in range(4)]
+    else:
+        if len(fixed_border_offsets) != 4:
+            raise ValueError("fixed_border_offsets must contain four offsets")
+        border_offsets = [int(value) for value in fixed_border_offsets]
+        if any(value < 0 or value >= frame_size for value in border_offsets):
+            raise ValueError("fixed_border_offsets must lie inside the frame")
     bounds = [
         billiards.InfiniteWall(
             (0, border_offsets[0]),
@@ -162,6 +170,49 @@ def setup_billiard_game(
             bld.add_ball((x, y), (0, 0), ball_radius)
         num_balls_added += 1
     return bld, border_offsets
+
+
+def inject_collision_type(
+    bld: billiards.Billiard,
+    frame_size: int,
+    ball_radius: float,
+    border_offsets: list[int],
+    collision_type: str,
+) -> None:
+    """Create a controlled collision geometry while preserving the original simulator."""
+    if collision_type == "none" or len(bld.balls_position) < 2:
+        return
+    positions = np.asarray(bld.balls_position)
+    velocities = np.asarray(bld.balls_velocity)
+    left, top, right, bottom = border_offsets
+    xmin, xmax = left + ball_radius, frame_size - right - ball_radius
+    ymin, ymax = top + ball_radius, frame_size - bottom - ball_radius
+    speed = frame_size * 0.42
+    gap = 2.15 * ball_radius
+    cx, cy = (xmin + xmax) * 0.5, (ymin + ymax) * 0.5
+
+    if collision_type in {"head_on", "glancing", "crossing"}:
+        if collision_type == "head_on":
+            offset = 0.0
+            tangent = 0.0
+        elif collision_type == "glancing":
+            offset = 0.65 * ball_radius
+            tangent = 0.28
+        else:
+            offset = -0.45 * ball_radius
+            tangent = -0.42
+        positions[0] = (cx - gap * 0.5, cy - offset)
+        positions[1] = (cx + gap * 0.5, cy + offset)
+        velocities[0] = (speed, tangent * speed)
+        velocities[1] = (-speed, -0.15 * tangent * speed)
+    elif collision_type in {"wall_grazing", "wall_tangent"}:
+        x = xmax - 0.55 * ball_radius
+        y = ymin + 0.35 * (ymax - ymin)
+        positions[0] = (x, y)
+        angle = 0.18 if collision_type == "wall_grazing" else 0.55
+        velocities[0] = (speed * 0.9, speed * angle)
+    else:
+        raise ValueError(f"Unknown collision_type: {collision_type}")
 
 
 def simulate_billiard_game(
@@ -344,6 +395,8 @@ class BilliardSimDataset(torch.utils.data.IterableDataset):
         return_full_video: bool = False,
         collision_loss_weight: float = 1.0,
         collision_window_steps: int = 0,
+        fixed_border_offsets: tuple[int, int, int, int] | None = None,
+        collision_type_probs: dict[str, float] | None = None,
     ):
         super().__init__()
         self.frame_size = frame_size
@@ -359,6 +412,13 @@ class BilliardSimDataset(torch.utils.data.IterableDataset):
             raise ValueError("collision_window_steps must be non-negative")
         self.collision_loss_weight = float(collision_loss_weight)
         self.collision_window_steps = int(collision_window_steps)
+        self.fixed_border_offsets = fixed_border_offsets
+        self.collision_type_probs = collision_type_probs
+        if collision_type_probs is not None:
+            if not collision_type_probs or any(value < 0 for value in collision_type_probs.values()):
+                raise ValueError("collision_type_probs must contain non-negative probabilities")
+            if sum(collision_type_probs.values()) <= 0:
+                raise ValueError("collision_type_probs must have positive total probability")
 
         border_offset_range = np.array(border_offset_range)
         self.min_border_offset = max(math.floor(border_offset_range.min() * frame_size), 0)
@@ -373,7 +433,16 @@ class BilliardSimDataset(torch.utils.data.IterableDataset):
                 self.nr_balls,
                 self.ball_radius,
                 self.p_moving,
+                self.fixed_border_offsets,
             )
+            if self.collision_type_probs is not None:
+                collision_types = list(self.collision_type_probs)
+                collision_probs = np.asarray([self.collision_type_probs[key] for key in collision_types], dtype=float)
+                collision_probs /= collision_probs.sum()
+                collision_type = str(np.random.choice(collision_types, p=collision_probs))
+                inject_collision_type(
+                    bld, self.frame_size, self.ball_radius, border_offsets, collision_type
+                )
             ts, pos, vel, collisions, ball_collision_masks = simulate_billiard_game(
                 bld, self.duration, self.dt, return_ball_collision_mask=True
             )

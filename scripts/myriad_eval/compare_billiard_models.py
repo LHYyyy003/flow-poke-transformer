@@ -191,6 +191,7 @@ def load_model(
             "transformer.long_history_bias_generator.",
             "transformer.physics_source_logit",
             "transformer.long_history_source_logit",
+            "transformer.combined_gate_mlp.",
         )
     invalid_missing = [
         key for key in incompatible.missing_keys

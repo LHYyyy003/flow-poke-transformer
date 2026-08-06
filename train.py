@@ -73,6 +73,7 @@ def configure_combined_bias_training(model, train_mode: str, unfreeze_last_n_lay
         if parameter is None:
             raise ValueError(f"Combined model is missing {name}")
         parameter.requires_grad_(True)
+    set_requires_grad(model.transformer.combined_gate_mlp, True)
     if train_mode == "finetune":
         depth = len(model.transformer.mid_level)
         if unfreeze_last_n_layers <= 0 or unfreeze_last_n_layers > depth:
@@ -143,6 +144,7 @@ def load_init_checkpoint(model, path):
         "transformer.long_history_bias_generator.",
         "transformer.physics_source_logit",
         "transformer.long_history_source_logit",
+        "transformer.combined_gate_mlp.",
     )
     invalid_missing = [key for key in incompatible.missing_keys
                        if not key.startswith(allowed_missing_prefixes)]
@@ -958,6 +960,14 @@ def train_billiards_long_history(train_mode, unfreeze_last_n_layers,
             dt=dt,
             collision_loss_weight=collision_loss_weight,
             collision_window_steps=collision_window_steps,
+            fixed_border_offsets=(77, 77, 77, 77),
+            collision_type_probs={
+                "head_on": 0.25,
+                "glancing": 0.35,
+                "crossing": 0.20,
+                "wall_grazing": 0.12,
+                "wall_tangent": 0.08,
+            },
         )},
     )
 
@@ -1040,8 +1050,16 @@ def train_billiards_combined_gated(train_mode, unfreeze_last_n_layers,
 
     config_dict = dict(
         model="billiard-combined-gated", dataset="billiards",
-        dataset_variant="original_billiards_sim",
+        dataset_variant="original_fixed_boundary_collision_mix",
         dataset_generator="myriad.data_billiards.BilliardSimDataset",
+        fixed_border_offsets=(77, 77, 77, 77),
+        collision_type_probs={
+            "head_on": 0.25,
+            "glancing": 0.35,
+            "crossing": 0.20,
+            "wall_grazing": 0.12,
+            "wall_tangent": 0.08,
+        },
         batch_size=batch_size,
         num_workers=num_workers, nr_balls=nr_balls, frame_size=frame_size,
         duration=duration, dt=dt, train_mode=train_mode,
