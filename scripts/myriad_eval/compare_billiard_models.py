@@ -30,6 +30,7 @@ from myriad.model import (
     MyriadStepByStep_Large_Billiard,
     MyriadStepByStep_Large_Billiard_PhysicsBias,
     MyriadStepByStep_Large_Billiard_LongHistoryBias,
+    MyriadStepByStep_Large_Billiard_CombinedBias,
 )
 
 # The repository's unconditional compiled FlexAttention kernel exceeds the
@@ -136,9 +137,12 @@ def load_model(
     physics_kinematics_mode: str = "long",
     collision_long_history_distance: float = 0.04,
     collision_long_history_temperature: float = 0.008,
+    long_history_checkpoint_path: Path | None = None,
 ):
     if kind.startswith("physics_bias"):
         constructor = MyriadStepByStep_Large_Billiard_PhysicsBias
+    elif kind.startswith("combined_bias"):
+        constructor = MyriadStepByStep_Large_Billiard_CombinedBias
     elif kind.startswith("long_history_bias"):
         constructor = MyriadStepByStep_Large_Billiard_LongHistoryBias
     else:
@@ -155,6 +159,22 @@ def load_model(
         ): value
         for key, value in checkpoint["model"].items()
     }
+    if kind.startswith("combined_bias"):
+        if long_history_checkpoint_path is None:
+            raise ValueError("combined_bias requires long_history_checkpoint_path")
+        temporal_checkpoint = torch.load(
+            long_history_checkpoint_path, weights_only=False, mmap=True, map_location="cpu"
+        )
+        temporal_state = temporal_checkpoint["model"]
+        for key, value in temporal_state.items():
+            if key.startswith("transformer.physics_bias_generator."):
+                temporal_key = key.replace(
+                    "transformer.physics_bias_generator.",
+                    "transformer.long_history_bias_generator.",
+                    1,
+                )
+                state_dict[temporal_key] = value
+        del temporal_checkpoint
     physics_input_key = "transformer.physics_bias_generator.mlp.0.weight"
     if physics_input_key in state_dict:
         source = state_dict[physics_input_key]
@@ -164,12 +184,12 @@ def load_model(
             expanded[..., :source.shape[-1]] = source
             state_dict[physics_input_key] = expanded
     model.load_state_dict(state_dict, strict=True)
-    if kind.startswith("physics_bias") and physics_max_abs is not None:
+    if (kind.startswith("physics_bias") or kind.startswith("combined_bias")) and physics_max_abs is not None:
         model.transformer.physics_bias_generator.max_abs_bias = physics_max_abs
-    if kind.startswith("physics_bias") and physics_strength is not None:
+    if (kind.startswith("physics_bias") or kind.startswith("combined_bias")) and physics_strength is not None:
         with torch.no_grad():
             model.transformer.physics_bias_generator.layer_head_scales.mul_(physics_strength)
-    if kind.startswith("physics_bias"):
+    if kind.startswith("physics_bias") or kind.startswith("combined_bias"):
         model.transformer.physics_bias_generator.set_kinematics_mode(
             physics_kinematics_mode,
             collision_distance=collision_long_history_distance,

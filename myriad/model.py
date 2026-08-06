@@ -1143,8 +1143,6 @@ class FusedTransformer(nn.Module):
         self.time_norm_size = time_norm_size
         self.use_physics_bias = use_physics_bias
         self.use_long_history_bias = use_long_history_bias
-        if use_physics_bias and use_long_history_bias:
-            raise ValueError("physics and long-history attention biases are mutually exclusive")
         physics_bias_num_layers = min(4, depth) if physics_bias_num_layers is None else physics_bias_num_layers
         long_history_bias_num_layers = (
             min(4, depth) if long_history_bias_num_layers is None else long_history_bias_num_layers
@@ -1155,9 +1153,7 @@ class FusedTransformer(nn.Module):
             raise ValueError(
                 f"long_history_bias_num_layers must be in [1, {depth}], got {long_history_bias_num_layers}"
             )
-        self.physics_bias_num_layers = (
-            long_history_bias_num_layers if use_long_history_bias else physics_bias_num_layers
-        )
+        self.physics_bias_num_layers = max(physics_bias_num_layers, long_history_bias_num_layers)
         # self.use_full_skip = use_full_skip
 
         self.embedder = FlowPokeEmbedder(
@@ -1198,6 +1194,8 @@ class FusedTransformer(nn.Module):
             mid_level.append(layer)
         self.mid_level = Level(mid_level)
 
+        self.physics_bias_generator = None
+        self.long_history_bias_generator = None
         if use_physics_bias:
             self.physics_bias_generator = PhysicsRelationBiasMLP(
                 n_heads=width // d_head,
@@ -1213,8 +1211,8 @@ class FusedTransformer(nn.Module):
                 query_chunk_size=physics_bias_query_chunk_size,
                 checkpoint_chunks=physics_bias_checkpoint_chunks,
             )
-        elif use_long_history_bias:
-            self.physics_bias_generator = LongHistoryAttentionBiasMLP(
+        if use_long_history_bias:
+            long_history_generator = LongHistoryAttentionBiasMLP(
                 n_heads=width // d_head,
                 hidden_dim=long_history_bias_hidden_dim,
                 depth=long_history_bias_depth,
@@ -1226,8 +1224,12 @@ class FusedTransformer(nn.Module):
                 query_chunk_size=long_history_bias_query_chunk_size,
                 checkpoint_chunks=long_history_bias_checkpoint_chunks,
             )
-        else:
-            self.physics_bias_generator = None
+            # Keep the historical state-dict path for the temporal-only model;
+            # combined models use the dedicated second generator path.
+            if use_physics_bias:
+                self.long_history_bias_generator = long_history_generator
+            else:
+                self.physics_bias_generator = long_history_generator
         self.register_buffer("physics_pos_cache", torch.empty((1, 0, 2)), persistent=False)
         self.register_buffer("physics_time_cache", torch.empty((1, 0)), persistent=False)
         self.register_buffer("physics_track_cache", torch.empty((1, 0), dtype=torch.long), persistent=False)
@@ -1333,10 +1335,13 @@ class FusedTransformer(nn.Module):
         skip = x[:, L_cross:]
 
         physics_bias = None
+        long_history_bias = None
         q_motion_offset = k_motion_offset = 0
         if self.use_physics_bias or self.use_long_history_bias:
-            if self.physics_bias_generator is None:
-                raise AssertionError("relation attention bias enabled without a generator")
+            if self.use_physics_bias and self.physics_bias_generator is None:
+                raise AssertionError("use_physics_bias=True without a generator")
+            if self.use_long_history_bias and self.long_history_bias_generator is None and self.physics_bias_generator is None:
+                raise AssertionError("use_long_history_bias=True without a generator")
             B_motion, L_motion, _ = motion_pos_current.shape
             if i_kv is None:
                 pos_k, time_k, track_k = motion_pos_current, motion_time_current, motion_track_current
@@ -1369,10 +1374,17 @@ class FusedTransformer(nn.Module):
                 query_k = self.physics_query_cache[:B_motion, :write_end]
                 q_motion_offset = L_cross if i_kv == 0 else 0
                 k_motion_offset = self.cached_image_prefix_length
-            physics_bias = self.physics_bias_generator(
-                motion_pos_current, motion_time_current, motion_track_current, pos_k, time_k, track_k,
-                motion_query_current, query_k,
-            )
+            if self.use_physics_bias:
+                physics_bias = self.physics_bias_generator(
+                    motion_pos_current, motion_time_current, motion_track_current, pos_k, time_k, track_k,
+                    motion_query_current, query_k,
+                )
+            if self.use_long_history_bias:
+                long_generator = self.long_history_bias_generator or self.physics_bias_generator
+                long_history_bias = long_generator(
+                    motion_pos_current, motion_time_current, motion_track_current, pos_k, time_k, track_k,
+                    motion_query_current, query_k,
+                )
 
         # standard transformer forward
         B, *DIMS, C = x.shape
@@ -1380,10 +1392,15 @@ class FusedTransformer(nn.Module):
         first_physics_layer = len(self.mid_level) - self.physics_bias_num_layers
         for layer_index, layer in enumerate(self.mid_level):
             layer_bias = None
-            if physics_bias is not None and layer_index >= first_physics_layer:
-                layer_bias = self.physics_bias_generator.for_layer(
-                    physics_bias, layer_index - first_physics_layer
-                )
+            if (physics_bias is not None or long_history_bias is not None) and layer_index >= first_physics_layer:
+                active_index = layer_index - first_physics_layer
+                bias_parts = []
+                if physics_bias is not None:
+                    bias_parts.append(self.physics_bias_generator.for_layer(physics_bias, active_index))
+                if long_history_bias is not None:
+                    long_generator = self.long_history_bias_generator or self.physics_bias_generator
+                    bias_parts.append(long_generator.for_layer(long_history_bias, active_index))
+                layer_bias = torch.stack(bias_parts, dim=0).sum(dim=0)
             x = layer(x, theta, scale=scale, block_mask=block_mask, i_kv=i_kv,
                       physics_bias=layer_bias, q_motion_offset=q_motion_offset,
                       k_motion_offset=k_motion_offset, **kwargs)
@@ -2458,6 +2475,63 @@ MyriadStepByStep_Large_Billiard_LongHistoryBias = partial(
         "long_history_bias_window": 8,
         "long_history_bias_query_chunk_size": 64,
         "long_history_bias_checkpoint_chunks": False,
+    },
+    image_feature_extractor_params={
+        "model_version": "dinov3_vitl16",
+        "image_size": 512,
+    },
+    distribution_head_params={
+        "depth": 3,
+        "d_cond": 1024,
+        "expansion_factor": 1,
+        "internal_value_scale": 500,
+        "value_scale_cascade": True,
+        "value_scale_cascade_steps": 512,
+        "cat_embs": False,
+        "relu": False,
+        "cond_dropout": 0.0,
+        "steps": 50,
+        "cfg_scale": 1.0,
+    },
+)
+
+MyriadStepByStep_Large_Billiard_CombinedBias = partial(
+    MyriadStepByStep,
+    width=1024,
+    depth=24,
+    train_image_feature_extractor=True,
+    distribution_type="fm",
+    transformer_params={
+        "d_head": 128,
+        "out_mlp_depth": 2,
+        "ff_expand": 4,
+        "ada_norm_size": 1024,
+        "time_norm_size": -1,
+        "input_scale": 10,
+        "emb_depth": 3,
+        "track_id_embedding": True,
+        "max_num_track_ids": 256,
+        "scaled_cosine_sim": True,
+        "use_physics_bias": True,
+        "use_long_history_bias": True,
+        "physics_bias_hidden_dim": 64,
+        "physics_bias_depth": 2,
+        "physics_bias_time_scale": 50.0,
+        "physics_bias_max_abs": 1.0,
+        "physics_bias_ball_radius": 0.033,
+        "physics_bias_num_layers": 4,
+        "physics_bias_initial_scale": 0.5,
+        "physics_bias_history_window": 8,
+        "physics_bias_history_decay": 4.0,
+        "physics_bias_query_chunk_size": 64,
+        "long_history_bias_hidden_dim": 64,
+        "long_history_bias_depth": 2,
+        "long_history_bias_time_scale": 50.0,
+        "long_history_bias_max_abs": 0.25,
+        "long_history_bias_num_layers": 4,
+        "long_history_bias_initial_scale": 0.25,
+        "long_history_bias_window": 8,
+        "long_history_bias_query_chunk_size": 64,
     },
     image_feature_extractor_params={
         "model_version": "dinov3_vitl16",

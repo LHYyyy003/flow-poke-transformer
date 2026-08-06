@@ -61,13 +61,14 @@ def test_long_history_bias_shape_zero_init_and_gradients():
     assert module.mlp[-1].weight.grad is not None
 
 
-def test_long_history_and_physics_bias_are_mutually_exclusive():
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        FusedTransformer(
-            width=16, depth=2, aux_feat_dim=8, d_head=8, out_mlp_depth=1,
-            ff_expand=2, track_id_embedding=False,
-            use_physics_bias=True, use_long_history_bias=True,
-        )
+def test_long_history_and_physics_bias_can_be_combined():
+    model = FusedTransformer(
+        width=16, depth=2, aux_feat_dim=8, d_head=8, out_mlp_depth=1,
+        ff_expand=2, track_id_embedding=False,
+        use_physics_bias=True, use_long_history_bias=True,
+    )
+    assert model.physics_bias_generator is not None
+    assert model.long_history_bias_generator is not None
 
 
 def test_negative_initial_layer_scale_is_rejected():
