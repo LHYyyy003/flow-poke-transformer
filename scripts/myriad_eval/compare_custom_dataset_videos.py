@@ -166,6 +166,15 @@ def main() -> None:
         "--long-history", type=Path,
         help="Optional non-physical temporal-only long-history checkpoint.",
     )
+    parser.add_argument(
+        "--long-history-label", type=str,
+        default="TEMPORAL-ONLY LONG HISTORY (1000)",
+        help="Label used for the optional long-history video panel.",
+    )
+    parser.add_argument(
+        "--long-history-key", type=str, default="long_history_1000",
+        help="Output key and video stem for the optional long-history model.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--sample-index", type=int, default=-1)
     parser.add_argument(
@@ -196,6 +205,7 @@ def main() -> None:
     torch.cuda.init()
     predictions = {}
     steps = {}
+    long_history_key = args.long_history_key
     predictions["original"], steps["original"] = predict(
         args.original, "original", "short", image, truth, device, args.dino_path
     )
@@ -207,7 +217,7 @@ def main() -> None:
         args.dino_path, strength=args.bias_long_strength,
     )
     if args.long_history is not None:
-        predictions["long_history_1000"], steps["long_history_1000"] = predict(
+        predictions[long_history_key], steps[long_history_key] = predict(
             args.long_history, "long_history_bias", "temporal-only", image, truth,
             device, args.dino_path,
         )
@@ -221,16 +231,16 @@ def main() -> None:
             f"BIAS + SMOOTH LONG HISTORY (x{args.bias_long_strength:g})", truth_np,
         ),
     }
-    if "long_history_1000" in predictions:
-        frame_sets["long_history_1000"] = render_frames(
-            data_module, predictions["long_history_1000"], sample,
-            "TEMPORAL-ONLY LONG HISTORY (1000)", truth_np,
+    if long_history_key in predictions:
+        frame_sets[long_history_key] = render_frames(
+            data_module, predictions[long_history_key], sample,
+            args.long_history_label, truth_np,
         )
     for name, frames in frame_sets.items():
         write_video(args.output_dir / f"{name}.mp4", frames, args.fps)
     comparison_names = ["ground_truth", "original", "bias_only", "bias_long"]
-    if "long_history_1000" in frame_sets:
-        comparison_names.append("long_history_1000")
+    if long_history_key in frame_sets:
+        comparison_names.append(long_history_key)
     comparison = np.concatenate([frame_sets[name] for name in comparison_names], axis=2)
     write_video(args.output_dir / "comparison.mp4", comparison, args.fps)
 
@@ -256,9 +266,9 @@ def main() -> None:
         },
         "accuracy": {name: accuracy(value, truth_np) for name, value in predictions.items()},
     }
-    if "long_history_1000" in predictions:
-        metrics["checkpoints"]["long_history_1000"] = {
-            "path": str(args.long_history), "step": steps["long_history_1000"],
+    if long_history_key in predictions:
+        metrics["checkpoints"][long_history_key] = {
+            "path": str(args.long_history), "step": steps[long_history_key],
             "kinematics": "temporal-only",
         }
     (args.output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
