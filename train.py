@@ -1039,7 +1039,10 @@ def train_billiards_combined_gated(train_mode, unfreeze_last_n_layers,
         return model
 
     config_dict = dict(
-        model="billiard-combined-gated", dataset="billiards", batch_size=batch_size,
+        model="billiard-combined-gated", dataset="billiards",
+        dataset_variant="original_billiards_sim",
+        dataset_generator="myriad.data_billiards.BilliardSimDataset",
+        batch_size=batch_size,
         num_workers=num_workers, nr_balls=nr_balls, frame_size=frame_size,
         duration=duration, dt=dt, train_mode=train_mode,
         unfreeze_last_n_layers=unfreeze_last_n_layers,
