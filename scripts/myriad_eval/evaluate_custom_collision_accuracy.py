@@ -182,6 +182,8 @@ def main():
     parser.add_argument("--long-history-500", type=Path, required=True)
     parser.add_argument("--combined-physics", type=Path, default=None,
                         help="Physics checkpoint used for the combined variant; defaults to --physics-500")
+    parser.add_argument("--combined-gated", type=Path, default=None,
+                        help="Jointly trained combined physics+long-history checkpoint")
     parser.add_argument(
         "--gated-long-history", type=Path, action="append", default=None,
         help="Optional trained long-history checkpoint with cross-track gating; repeat for multiple steps",
@@ -228,6 +230,11 @@ def main():
         models["combined_500"] = load_model(
             "physics_bias", combined_checkpoint, device, physics_strength=1.0,
             physics_kinematics_mode="collision-smooth",
+        )[0]
+    if args.combined_gated is not None:
+        models["combined_gated_500"] = load_model(
+            "combined_bias", args.combined_gated, device,
+            physics_strength=1.0, physics_kinematics_mode="collision-smooth",
         )[0]
     if args.gated_long_history is not None:
         for checkpoint in args.gated_long_history:

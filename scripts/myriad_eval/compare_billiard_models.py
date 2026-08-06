@@ -160,21 +160,20 @@ def load_model(
         for key, value in checkpoint["model"].items()
     }
     if kind.startswith("combined_bias"):
-        if long_history_checkpoint_path is None:
-            raise ValueError("combined_bias requires long_history_checkpoint_path")
-        temporal_checkpoint = torch.load(
-            long_history_checkpoint_path, weights_only=False, mmap=True, map_location="cpu"
-        )
-        temporal_state = temporal_checkpoint["model"]
-        for key, value in temporal_state.items():
-            if key.startswith("transformer.physics_bias_generator."):
-                temporal_key = key.replace(
-                    "transformer.physics_bias_generator.",
-                    "transformer.long_history_bias_generator.",
-                    1,
-                )
-                state_dict[temporal_key] = value
-        del temporal_checkpoint
+        if long_history_checkpoint_path is not None:
+            temporal_checkpoint = torch.load(
+                long_history_checkpoint_path, weights_only=False, mmap=True, map_location="cpu"
+            )
+            temporal_state = temporal_checkpoint["model"]
+            for key, value in temporal_state.items():
+                if key.startswith("transformer.physics_bias_generator."):
+                    temporal_key = key.replace(
+                        "transformer.physics_bias_generator.",
+                        "transformer.long_history_bias_generator.",
+                        1,
+                    )
+                    state_dict[temporal_key] = value
+            del temporal_checkpoint
     physics_input_key = "transformer.physics_bias_generator.mlp.0.weight"
     if physics_input_key in state_dict:
         source = state_dict[physics_input_key]
@@ -188,7 +187,11 @@ def load_model(
     if kind.startswith("long_history_bias"):
         allowed_missing_prefixes = ("transformer.physics_bias_generator.",)
     elif kind.startswith("combined_bias"):
-        allowed_missing_prefixes = ("transformer.long_history_bias_generator.",)
+        allowed_missing_prefixes = (
+            "transformer.long_history_bias_generator.",
+            "transformer.physics_source_logit",
+            "transformer.long_history_source_logit",
+        )
     invalid_missing = [
         key for key in incompatible.missing_keys
         if not key.startswith(allowed_missing_prefixes)
