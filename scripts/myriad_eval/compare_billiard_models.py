@@ -26,7 +26,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from myriad.data_billiards import render_billiard_frame, simulate_billiard_game
 import myriad.model as myriad_model
-from myriad.model import MyriadStepByStep_Large_Billiard, MyriadStepByStep_Large_Billiard_PhysicsBias
+from myriad.model import (
+    MyriadStepByStep_Large_Billiard,
+    MyriadStepByStep_Large_Billiard_PhysicsBias,
+    MyriadStepByStep_Large_Billiard_LongHistoryBias,
+)
 
 # The repository's unconditional compiled FlexAttention kernel exceeds the
 # per-block resource limit on RTX 5090 for this prefill shape. The physics path
@@ -133,11 +137,12 @@ def load_model(
     collision_long_history_distance: float = 0.04,
     collision_long_history_temperature: float = 0.008,
 ):
-    constructor = (
-        MyriadStepByStep_Large_Billiard_PhysicsBias
-        if kind.startswith("physics_bias")
-        else MyriadStepByStep_Large_Billiard
-    )
+    if kind.startswith("physics_bias"):
+        constructor = MyriadStepByStep_Large_Billiard_PhysicsBias
+    elif kind.startswith("long_history_bias"):
+        constructor = MyriadStepByStep_Large_Billiard_LongHistoryBias
+    else:
+        constructor = MyriadStepByStep_Large_Billiard
     start = time.perf_counter()
     model = constructor()
     checkpoint = torch.load(checkpoint_path, weights_only=False, mmap=True, map_location="cpu")
@@ -172,6 +177,8 @@ def load_model(
         )
     if kind == "physics_bias_disabled":
         model.transformer.use_physics_bias = False
+    if kind == "long_history_bias_disabled":
+        model.transformer.use_long_history_bias = False
     step = int(checkpoint.get("step", -1))
     del checkpoint
     model.requires_grad_(False).eval().to(device)

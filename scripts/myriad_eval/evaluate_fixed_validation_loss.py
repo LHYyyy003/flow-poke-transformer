@@ -64,8 +64,9 @@ def evaluate(
     bias_enabled: bool,
     batches: list[dict[str, torch.Tensor]],
     device: torch.device,
+    kind: str | None = None,
 ) -> dict:
-    kind = "physics_bias" if bias_enabled else "physics_bias_disabled"
+    kind = kind or ("physics_bias" if bias_enabled else "physics_bias_disabled")
     print(f"Evaluating fixed validation loss: {name}", flush=True)
     model, step, _ = load_model(
         kind,
@@ -105,7 +106,8 @@ def evaluate(
     result = {
         "checkpoint": str(checkpoint),
         "checkpoint_step": step,
-        "physics_bias_enabled": bias_enabled,
+        "attention_bias_enabled": bias_enabled,
+        "model_kind": kind,
         "per_batch": per_batch,
         "summary": {key: summarize([row[key] for row in per_batch]) for key in keys},
     }
