@@ -162,6 +162,10 @@ def main() -> None:
     parser.add_argument("--original", type=Path, required=True)
     parser.add_argument("--bias-only", type=Path, required=True)
     parser.add_argument("--bias-long", type=Path, required=True)
+    parser.add_argument(
+        "--long-history", type=Path,
+        help="Optional non-physical temporal-only long-history checkpoint.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--sample-index", type=int, default=-1)
     parser.add_argument(
@@ -174,6 +178,8 @@ def main() -> None:
     args = parser.parse_args()
     if not (args.dino_path / "config.json").is_file():
         parser.error(f"Missing local DINOv3 snapshot: {args.dino_path}")
+    if args.long_history is not None and not args.long_history.is_file():
+        parser.error(f"Missing long-history checkpoint: {args.long_history}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     data_module = load_custom_data_module()
@@ -200,6 +206,11 @@ def main() -> None:
         args.bias_long, "physics_bias", "collision-smooth", image, truth, device,
         args.dino_path, strength=args.bias_long_strength,
     )
+    if args.long_history is not None:
+        predictions["long_history_1000"], steps["long_history_1000"] = predict(
+            args.long_history, "long_history_bias", "temporal-only", image, truth,
+            device, args.dino_path,
+        )
 
     frame_sets = {
         "ground_truth": render_frames(data_module, truth_np, sample, "GROUND TRUTH"),
@@ -210,12 +221,17 @@ def main() -> None:
             f"BIAS + SMOOTH LONG HISTORY (x{args.bias_long_strength:g})", truth_np,
         ),
     }
+    if "long_history_1000" in predictions:
+        frame_sets["long_history_1000"] = render_frames(
+            data_module, predictions["long_history_1000"], sample,
+            "TEMPORAL-ONLY LONG HISTORY (1000)", truth_np,
+        )
     for name, frames in frame_sets.items():
         write_video(args.output_dir / f"{name}.mp4", frames, args.fps)
-    comparison = np.concatenate(
-        [frame_sets[name] for name in ("ground_truth", "original", "bias_only", "bias_long")],
-        axis=2,
-    )
+    comparison_names = ["ground_truth", "original", "bias_only", "bias_long"]
+    if "long_history_1000" in frame_sets:
+        comparison_names.append("long_history_1000")
+    comparison = np.concatenate([frame_sets[name] for name in comparison_names], axis=2)
     write_video(args.output_dir / "comparison.mp4", comparison, args.fps)
 
     metrics = {
@@ -240,6 +256,11 @@ def main() -> None:
         },
         "accuracy": {name: accuracy(value, truth_np) for name, value in predictions.items()},
     }
+    if "long_history_1000" in predictions:
+        metrics["checkpoints"]["long_history_1000"] = {
+            "path": str(args.long_history), "step": steps["long_history_1000"],
+            "kinematics": "temporal-only",
+        }
     (args.output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     np.savez_compressed(args.output_dir / "trajectories.npz", truth=truth_np, **predictions)
     print(json.dumps(metrics, indent=2))
