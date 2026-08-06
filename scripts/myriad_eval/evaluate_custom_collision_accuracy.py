@@ -202,6 +202,10 @@ def main():
         "--only-combined-gated-checkpoints", action="store_true",
         help="Evaluate only repeated --combined-gated checkpoints",
     )
+    parser.add_argument(
+        "--include-original", action="store_true",
+        help="Include the original no-bias baseline in a scoped comparison",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dino-path", type=Path, required=True)
     parser.add_argument("--scenes-per-category", type=int, default=10)
@@ -245,6 +249,8 @@ def main():
                 "combined_bias", checkpoint, device,
                 physics_strength=1.0, physics_kinematics_mode="collision-smooth",
             )[0]
+    if args.include_original:
+        models["original"] = load_model("original", args.original, device)[0]
     if args.gated_long_history is not None:
         for checkpoint in args.gated_long_history:
             step = checkpoint.stem.rsplit("_", 1)[-1].lstrip("0") or "0"
