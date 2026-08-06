@@ -1148,6 +1148,9 @@ class FusedTransformer(nn.Module):
         long_history_bias_query_chunk_size: int = 64,
         long_history_bias_cross_track_initial_scale: float = 0.1,
         long_history_bias_checkpoint_chunks: bool = False,
+        use_combined_bias_gates: bool = False,
+        combined_physics_initial_scale: float = 0.5,
+        combined_long_history_initial_scale: float = 0.25,
         # use_full_skip: bool = True,
         # num_learnable_track_ids: int = -1,
     ):
@@ -1157,6 +1160,9 @@ class FusedTransformer(nn.Module):
         self.time_norm_size = time_norm_size
         self.use_physics_bias = use_physics_bias
         self.use_long_history_bias = use_long_history_bias
+        self.use_combined_bias_gates = bool(
+            use_combined_bias_gates and use_physics_bias and use_long_history_bias
+        )
         physics_bias_num_layers = min(4, depth) if physics_bias_num_layers is None else physics_bias_num_layers
         long_history_bias_num_layers = (
             min(4, depth) if long_history_bias_num_layers is None else long_history_bias_num_layers
@@ -1245,6 +1251,18 @@ class FusedTransformer(nn.Module):
                 self.long_history_bias_generator = long_history_generator
             else:
                 self.physics_bias_generator = long_history_generator
+        if self.use_combined_bias_gates:
+            if not 0.0 < combined_physics_initial_scale <= 1.0:
+                raise ValueError("combined_physics_initial_scale must be in (0, 1]")
+            if not 0.0 < combined_long_history_initial_scale <= 1.0:
+                raise ValueError("combined_long_history_initial_scale must be in (0, 1]")
+            n_heads = width // d_head
+            self.physics_source_logit = nn.Parameter(torch.full(
+                (n_heads,), float(torch.logit(torch.tensor(combined_physics_initial_scale)))
+            ))
+            self.long_history_source_logit = nn.Parameter(torch.full(
+                (n_heads,), float(torch.logit(torch.tensor(combined_long_history_initial_scale)))
+            ))
         self.register_buffer("physics_pos_cache", torch.empty((1, 0, 2)), persistent=False)
         self.register_buffer("physics_time_cache", torch.empty((1, 0)), persistent=False)
         self.register_buffer("physics_track_cache", torch.empty((1, 0), dtype=torch.long), persistent=False)
@@ -1411,10 +1429,16 @@ class FusedTransformer(nn.Module):
                 active_index = layer_index - first_physics_layer
                 bias_parts = []
                 if physics_bias is not None:
-                    bias_parts.append(self.physics_bias_generator.for_layer(physics_bias, active_index))
+                    physics_part = self.physics_bias_generator.for_layer(physics_bias, active_index)
+                    if self.use_combined_bias_gates:
+                        physics_part = physics_part * torch.sigmoid(self.physics_source_logit)[None, :, None, None]
+                    bias_parts.append(physics_part)
                 if long_history_bias is not None:
                     long_generator = self.long_history_bias_generator or self.physics_bias_generator
-                    bias_parts.append(long_generator.for_layer(long_history_bias, active_index))
+                    long_part = long_generator.for_layer(long_history_bias, active_index)
+                    if self.use_combined_bias_gates:
+                        long_part = long_part * torch.sigmoid(self.long_history_source_logit)[None, :, None, None]
+                    bias_parts.append(long_part)
                 layer_bias = torch.stack(bias_parts, dim=0).sum(dim=0)
             x = layer(x, theta, scale=scale, block_mask=block_mask, i_kv=i_kv,
                       physics_bias=layer_bias, q_motion_offset=q_motion_offset,
@@ -2548,6 +2572,10 @@ MyriadStepByStep_Large_Billiard_CombinedBias = partial(
         "long_history_bias_initial_scale": 0.25,
         "long_history_bias_window": 8,
         "long_history_bias_query_chunk_size": 64,
+        "long_history_bias_cross_track_initial_scale": 0.1,
+        "use_combined_bias_gates": True,
+        "combined_physics_initial_scale": 0.5,
+        "combined_long_history_initial_scale": 0.25,
     },
     image_feature_extractor_params={
         "model_version": "dinov3_vitl16",

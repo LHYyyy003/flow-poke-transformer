@@ -59,6 +59,33 @@ def configure_physics_training(model, train_mode: str, unfreeze_last_n_layers: i
     return trainable
 
 
+def configure_combined_bias_training(model, train_mode: str, unfreeze_last_n_layers: int = 6):
+    """Train both physical and temporal relation-bias branches plus source gates."""
+    set_requires_grad(model, False)
+    physics = model.transformer.physics_bias_generator
+    temporal = model.transformer.long_history_bias_generator
+    if physics is None or temporal is None:
+        raise ValueError("Combined bias training requires both relation-bias generators")
+    set_requires_grad(physics, True)
+    set_requires_grad(temporal, True)
+    for name in ("physics_source_logit", "long_history_source_logit"):
+        parameter = getattr(model.transformer, name, None)
+        if parameter is None:
+            raise ValueError(f"Combined model is missing {name}")
+        parameter.requires_grad_(True)
+    if train_mode == "finetune":
+        depth = len(model.transformer.mid_level)
+        if unfreeze_last_n_layers <= 0 or unfreeze_last_n_layers > depth:
+            raise ValueError(f"unfreeze_last_n_layers must be in [1, {depth}], got {unfreeze_last_n_layers}")
+        for layer in model.transformer.mid_level[-unfreeze_last_n_layers:]:
+            set_requires_grad(layer, True)
+        set_requires_grad(model.transformer.out_proj, True)
+        set_requires_grad(model.distribution_head, True)
+    elif train_mode != "physics-only":
+        raise ValueError(f"Unknown train_mode: {train_mode}")
+    return [p for p in model.parameters() if p.requires_grad]
+
+
 def _strip_uniform_module_prefix(state_dict):
     keys = list(state_dict)
     if keys and all(key.startswith("module.") for key in keys):
@@ -111,8 +138,14 @@ def load_init_checkpoint(model, path):
             state_dict[physics_input_key] = expanded
 
     incompatible = model.load_state_dict(state_dict, strict=False)
+    allowed_missing_prefixes = (
+        "transformer.physics_bias_generator.",
+        "transformer.long_history_bias_generator.",
+        "transformer.physics_source_logit",
+        "transformer.long_history_source_logit",
+    )
     invalid_missing = [key for key in incompatible.missing_keys
-                       if not key.startswith("transformer.physics_bias_generator.")]
+                       if not key.startswith(allowed_missing_prefixes)]
     if invalid_missing or incompatible.unexpected_keys:
         raise RuntimeError(
             f"Unsafe init checkpoint: invalid missing={invalid_missing}, "
@@ -954,6 +987,78 @@ def train_billiards_long_history(train_mode, unfreeze_last_n_layers,
         make_train_fns=myriad_make_train_fns,
         config_dict=config_dict,
         configure_model=configure_physics_training,
+        train_mode=train_mode,
+        unfreeze_last_n_layers=unfreeze_last_n_layers,
+        **common_kwargs,
+    )
+
+
+@cli.command("billiards-combined-gated")
+@common_options
+@click.option("--train-mode", default="physics-only", show_default=True,
+              type=click.Choice(["physics-only", "finetune"]))
+@click.option("--unfreeze-last-n-layers", default=6, show_default=True, type=int)
+@click.option("--combined-bias-checkpoint-chunks/--no-combined-bias-checkpoint-chunks",
+              default=False, show_default=True)
+@click.option("--batch-size", default=1, show_default=True, type=int)
+@click.option("--num-workers", default=4, show_default=True, type=int)
+@click.option("--nr-balls", default=16, show_default=True, type=int)
+@click.option("--frame-size", default=512, show_default=True, type=int)
+@click.option("--duration", default=0.5, show_default=True, type=float)
+@click.option("--dt", default=0.01, show_default=True, type=float)
+@click.option("--collision-loss-weight", default=3.0, show_default=True, type=float)
+@click.option("--collision-window-steps", default=10, show_default=True, type=int)
+def train_billiards_combined_gated(train_mode, unfreeze_last_n_layers,
+                                    combined_bias_checkpoint_chunks, batch_size, num_workers,
+                                    nr_balls, frame_size, duration, dt,
+                                    collision_loss_weight, collision_window_steps, **common_kwargs):
+    """Train jointly gated physical and temporal relation-bias branches."""
+    from myriad.model import MyriadStepByStep_Large_Billiard_CombinedBias
+    from myriad.data_billiards import BilliardSimDataModule
+
+    data = BilliardSimDataModule(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        train={"dataset_config": dict(
+            nr_balls=nr_balls,
+            frame_size=frame_size,
+            duration=duration,
+            dt=dt,
+            collision_loss_weight=collision_loss_weight,
+            collision_window_steps=collision_window_steps,
+        )},
+    )
+
+    def model_cls():
+        model = MyriadStepByStep_Large_Billiard_CombinedBias()
+        model.transformer.physics_bias_generator.checkpoint_chunks = combined_bias_checkpoint_chunks
+        model.transformer.long_history_bias_generator.checkpoint_chunks = combined_bias_checkpoint_chunks
+        model.transformer.physics_bias_generator.set_kinematics_mode(
+            "collision-smooth", collision_distance=0.04, collision_temperature=0.008
+        )
+        return model
+
+    config_dict = dict(
+        model="billiard-combined-gated", dataset="billiards", batch_size=batch_size,
+        num_workers=num_workers, nr_balls=nr_balls, frame_size=frame_size,
+        duration=duration, dt=dt, train_mode=train_mode,
+        unfreeze_last_n_layers=unfreeze_last_n_layers,
+        use_physics_bias=True, use_long_history_bias=True,
+        use_combined_bias_gates=True,
+        combined_physics_initial_scale=0.5,
+        combined_long_history_initial_scale=0.25,
+        physics_kinematics_mode="collision-smooth",
+        long_history_checkpoint_chunks=combined_bias_checkpoint_chunks,
+        collision_loss_weight=collision_loss_weight,
+        collision_window_steps=collision_window_steps,
+        **common_kwargs,
+    )
+    _train(
+        data=data,
+        model_cls=model_cls,
+        make_train_fns=myriad_make_train_fns,
+        config_dict=config_dict,
+        configure_model=configure_combined_bias_training,
         train_mode=train_mode,
         unfreeze_last_n_layers=unfreeze_last_n_layers,
         **common_kwargs,
