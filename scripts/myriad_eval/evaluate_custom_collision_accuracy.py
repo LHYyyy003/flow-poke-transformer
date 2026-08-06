@@ -245,7 +245,11 @@ def main():
     if args.combined_gated is not None:
         for checkpoint in args.combined_gated:
             step = checkpoint.stem.rsplit("_", 1)[-1].lstrip("0") or "0"
-            models[f"combined_gated_{step}"] = load_model(
+            model_name = f"combined_gated_{step}"
+            if model_name in models:
+                parent = checkpoint.parents[3].name
+                model_name = f"{model_name}_{parent}"
+            models[model_name] = load_model(
                 "combined_bias", checkpoint, device,
                 physics_strength=1.0, physics_kinematics_mode="collision-smooth",
             )[0]
