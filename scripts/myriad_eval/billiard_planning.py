@@ -583,6 +583,11 @@ def test_one_example(
 @click.option("--checkpoint_path", type=str, required=True, help="Path to the checkpoint file containing the model weights and config.")
 @click.option("--duration", type=float, default=1.0, help="Duration of the billiard simulation in seconds.")
 @click.option("--method", type=str, default="ours", help="Planning method to use (default: 'ours').")
+@click.option(
+    "--disable-physics-bias/--enable-physics-bias",
+    default=False,
+    help="For ours-physics, keep the checkpoint weights but bypass physics attention bias.",
+)
 @click.option("--out_dir", type=str, default="eval_results/billiard_planning", help="Directory to save evaluation results.")
 @click.option("--tag", type=str, default=None, help="Optional tag to distinguish this evaluation run.")
 @click.option("--num_warmup", type=int, default=5, help="Number of warmup runs to perform before actual evaluation.")
@@ -601,6 +606,7 @@ def main(
     checkpoint_path: str,
     duration: float = 1.0,
     method: str = "ours",
+    disable_physics_bias: bool = False,
     out_dir: str = "eval_results/billiard_planning",
     tag: str | None = None,
     num_warmup: int = 5, 
@@ -626,8 +632,18 @@ def main(
     out_path.mkdir(parents=True, exist_ok=True)
 
     pred_function = None
+    if disable_physics_bias and method != "ours-physics":
+        raise click.UsageError("--disable-physics-bias requires --method ours-physics")
     if method in ("ours", "ours-physics"):
         model = get_model("billiard-physics" if method == "ours-physics" else "billiard", checkpoint_path)
+        if method == "ours-physics":
+            generator = model.transformer.physics_bias_generator
+            generator.set_kinematics_mode(
+                "collision-smooth",
+                collision_distance=0.04,
+                collision_temperature=0.008,
+            )
+            model.transformer.use_physics_bias = not disable_physics_bias
         pred_function = _ours_pred_function
     else:
         raise NotImplementedError(f"Method {method} not implemented.")

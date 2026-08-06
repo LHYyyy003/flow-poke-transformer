@@ -122,3 +122,58 @@ TensorBoard 事件已不在磁盘，因此以下精确曲线结论只针对这�
 五个场景覆盖了关键碰撞类型，但每类只有一个手工固定场景、一个 RF rollout seed；它足以揭示当前
 checkpoint 的强烈方向性退化，但不是最终统计显著性结论。下一阶段应扩展为每类多个初始位置、速度、
 角度和种子，并报告置信区间。
+
+## 关闭 physics bias 的直接消融
+
+对碰撞平滑 500 和 1500 checkpoint 保留全部权重及长时序配置，只设置
+`model.transformer.use_physics_bias = False`。两个 checkpoint 在五个场景的所有汇总指标逐值相同，
+并与原模型完全一致：宏 mean `0.0948217 px`、宏 P95 `0.651779 px`、宏 final
+`0.214649 px`、碰撞后窗口 `0.289849 px`。
+
+这排除了基础 Transformer、DINO 或 checkpoint 中其他权重被破坏的可能。physics-only 训练确实只改动
+了 relation bias 模块，而启用该模块正是预测变化和劣化的充分原因。碰撞平滑长时序在 bias 被关闭后
+没有独立输出路径，因此不会改变预测；所谓“保留长时序但去掉物理偏置”在当前架构中数值上就是原模型。
+
+规划评估现在支持：
+
+```bash
+python -m scripts.myriad_eval.billiard_planning \
+  --method ours-physics \
+  --checkpoint_path PATH \
+  --disable-physics-bias
+```
+
+原始消融结果位于
+`outputs/physics_multiscene_validation/smooth_bias_disabled_metrics.json`。
+
+## 固定数据、固定噪声的 loss 归因
+
+为排除在线数据和 RF 随机数变化，额外固定 8 个 batch（32 个训练分布样本），并为每个 batch 固定
+完全相同的 flow-matching 时间 `t` 和高斯噪声 `z`：
+
+| 对照 | 总 loss 变化 | collision loss 变化 | 单步 EPE 变化 |
+|---|---:|---:|---:|
+| smooth 500 开启 vs 关闭 bias | -3.06% | -4.57% | -0.61% |
+| smooth 1500 开启 vs 关闭 bias | -3.23% | -5.18% | -0.80% |
+| smooth 1500 vs 500，均开启 bias | -0.18% | -0.63% | -0.19% |
+
+同一批固定数据的关闭-bias loss 均值为 `0.06441`，batch 间标准差为 `0.02122`，即约 `33%`；
+所以在线数据难度变化确实是训练曲线大幅波动的重要来源。但固定随机性后，bias 又能稳定地小幅降低
+单步目标，说明数据并没有阻止优化。500→1500 的额外收益只有 `0.18%`，且小于该配对差异的标准误，
+说明模型在 500 步附近已到单步目标平台。
+
+结合多场景 rollout，根因排序为：
+
+1. **主要问题：模型机制与训练目标错位。** bias 降低约 `3%` 单步 RF loss，却可能提高长程 rollout
+   EPE；优化器正在成功优化错误的代理目标。
+2. **次要问题：数据和指标方差大。** 在线场景速度、碰撞比例与 RF 噪声使原始 loss 波动约 `30%`，
+   掩盖了只有千分之几的后续改进。
+3. **数据覆盖仍不够结构化。** 随机在线数据没有按正碰、斜碰、擦碰、墙碰和无碰撞分别提供固定验证，
+   也没有对自回归历史误差提供直接监督；这是训练目标错位持续存在的重要条件，但不是数据损坏。
+
+因此整体效果差不能简单归咎于“数据集有问题”。数据集制造了高方差并缺少长程验证约束；真正让模型
+劣化的是 learned physics bias 与单步 loss 的组合。若目标是可靠整体效果，当前应默认关闭 physics bias，
+再重新设计带短程 rollout/scheduled-sampling 的训练目标，而不是继续增加训练步数。
+
+固定-loss 原始结果位于
+`outputs/physics_multiscene_validation/fixed_validation_loss.json`。

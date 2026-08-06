@@ -224,6 +224,11 @@ def main() -> None:
         action="store_true",
         help="Evaluate only the collision-smooth 500- and 1500-step checkpoints.",
     )
+    parser.add_argument(
+        "--only-smooth-disabled",
+        action="store_true",
+        help="Evaluate collision-smooth checkpoints with physics attention bias disabled.",
+    )
     args = parser.parse_args()
     for path in (args.original, args.bias_only, args.long_500, args.long_1000, args.long_1500):
         if not path.is_file():
@@ -235,15 +240,26 @@ def main() -> None:
     scenes = [build_scene(spec) for spec in SCENE_SPECS]
     device = torch.device("cuda:0")
     torch.cuda.init()
-    if args.only_long_short_ablation and args.only_smooth:
+    restricted_modes = sum((
+        args.only_long_short_ablation,
+        args.only_smooth,
+        args.only_smooth_disabled,
+    ))
+    if restricted_modes > 1:
         parser.error("Choose at most one restricted evaluation mode")
-    if args.only_smooth:
+    if args.only_smooth or args.only_smooth_disabled:
         if args.smooth_500 is None or args.smooth_1500 is None:
-            parser.error("--only-smooth requires --smooth-500 and --smooth-1500")
-        variants = (
-            ("collision_smooth_500", "physics_bias", args.smooth_500, "collision-smooth"),
-            ("collision_smooth_1500", "physics_bias", args.smooth_1500, "collision-smooth"),
-        )
+            parser.error("Smooth evaluation requires --smooth-500 and --smooth-1500")
+        if args.only_smooth_disabled:
+            variants = (
+                ("collision_smooth_500_bias_disabled", "physics_bias_disabled", args.smooth_500, "collision-smooth"),
+                ("collision_smooth_1500_bias_disabled", "physics_bias_disabled", args.smooth_1500, "collision-smooth"),
+            )
+        else:
+            variants = (
+                ("collision_smooth_500", "physics_bias", args.smooth_500, "collision-smooth"),
+                ("collision_smooth_1500", "physics_bias", args.smooth_1500, "collision-smooth"),
+            )
     elif args.only_long_short_ablation:
         variants = (
             ("long_history_500_short_ablation", "physics_bias", args.long_500, "short"),
